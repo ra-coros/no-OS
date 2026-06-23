@@ -59,4 +59,5 @@ struct ad7124_init_param ad7124_ip = {
 	.spi_init = &ad7124_spi_ip,
 	.regs = ad7124_init_regs_default,
 	.spi_rdy_poll_cnt = 1000,
+	.active_device = ID_AD7124_8,
 };
