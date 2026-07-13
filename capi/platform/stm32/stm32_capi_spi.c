@@ -697,6 +697,92 @@ static int stm32_capi_spi_transceive_async(struct capi_spi_device *device,
 }
 
 /**
+ * @brief Perform an asynchronous SPI transceive operation using DMA.
+ * @param device - Pointer to the SPI device descriptor.
+ * @param transfer - Pointer to the transfer descriptor.
+ * @param timeout - Timeout value in milliseconds.
+ * @return 0 on success, negative error code otherwise.
+ */
+static int stm32_capi_spi_transceive_dma_async(struct capi_spi_device *device,
+		struct capi_spi_transfer *transfer,
+		int timeout)
+{
+	struct stm32_spi_priv_handle *priv_handle;
+	struct stm32_spi_device_extra *dev_extra;
+	HAL_StatusTypeDef hal_ret;
+	int ret;
+
+	if (!device || !device->controller || !transfer)
+		return -EINVAL;
+
+	priv_handle = device->controller->priv;
+	dev_extra = device->extra;
+
+	if (priv_handle->async_in_progress)
+		return -EBUSY;
+
+	/* Set up CS GPIO if needed */
+	ret = setup_cs_gpio(priv_handle, device);
+	if (ret)
+		return ret;
+
+	/* Configure SPI for this device */
+	ret = stm32_capi_spi_config_peripheral(priv_handle, device);
+	if (ret)
+		return ret;
+
+	priv_handle->current_transfer = transfer;
+	priv_handle->async_in_progress = true;
+
+	/* Assert CS (drive low for active-low CS) */
+	if (priv_handle->cs_initialized)
+		capi_gpio_pin_set_raw_value(&priv_handle->chip_select, CAPI_GPIO_LOW);
+
+	/* CS delay first */
+	if (dev_extra && dev_extra->cs_delay_first)
+		capi_wait_us(dev_extra->cs_delay_first);
+
+	if (transfer->tx_buf && transfer->rx_buf) {
+		hal_ret = HAL_SPI_TransmitReceive_DMA(&priv_handle->hspi,
+						     (uint8_t *)transfer->tx_buf,
+						     transfer->rx_buf,
+						     max(transfer->tx_size, transfer->rx_size));
+	} else if (transfer->tx_buf) {
+		hal_ret = HAL_SPI_Transmit_DMA(&priv_handle->hspi,
+					      (uint8_t *)transfer->tx_buf,
+					      transfer->tx_size);
+	} else if (transfer->rx_buf) {
+		hal_ret = HAL_SPI_Receive_DMA(&priv_handle->hspi,
+					     transfer->rx_buf,
+					     transfer->rx_size);
+	} else {
+		priv_handle->async_in_progress = false;
+		/* Deassert CS on error */
+		if (priv_handle->cs_initialized)
+			capi_gpio_pin_set_raw_value(&priv_handle->chip_select, CAPI_GPIO_HIGH);
+		return -EINVAL;
+	}
+
+	if (hal_ret != HAL_OK) {
+		priv_handle->async_in_progress = false;
+		priv_handle->current_transfer = NULL;
+		/* Deassert CS on error */
+		if (priv_handle->cs_initialized)
+			capi_gpio_pin_set_raw_value(&priv_handle->chip_select, CAPI_GPIO_HIGH);
+		switch (hal_ret) {
+		case HAL_BUSY:
+			return -EBUSY;
+		case HAL_ERROR:
+			return -EIO;
+		default:
+			return -EIO;
+		}
+	}
+
+	return 0;
+}
+
+/**
  * @brief Perform a synchronous SPI read command (TX then RX).
  * @param device - Pointer to the SPI device descriptor.
  * @param transfer - Pointer to the transfer descriptor.
@@ -1474,7 +1560,9 @@ const struct stm32_capi_spi_extended_ops stm32_capi_spi_extended_ops = {
 	.transfer_dma_async = stm32_capi_spi_transfer_dma_async,
 	.transfer_multiple_dma = stm32_capi_spi_transfer_multiple_dma,
 	.transfer_multiple_dma_async = stm32_capi_spi_transfer_multiple_dma_async,
+	.transceive_dma_async = stm32_capi_spi_transceive_dma_async,
 	.alternate_cs_enable = stm32_capi_spi_alternate_cs_enable,
+
 };
 
 /**

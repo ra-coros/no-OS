@@ -69,6 +69,9 @@ extern const struct capi_spi_ops stm32_capi_spi_ops;
  */
 struct stm32_capi_spi_extended_ops {
 	struct capi_spi_ops base_ops;
+	int (*transceive_dma_async)(struct capi_spi_device *device,
+				struct capi_spi_transfer *transfer,
+				int timeout);
 	int (*transfer_dma)(struct capi_spi_device *device,
 			    struct capi_spi_transfer *transfer);
 	int (*transfer_dma_async)(struct capi_spi_device *device,
@@ -113,6 +116,18 @@ int stm32_capi_spi_transfer_dma_async(struct capi_spi_device *device,
 				      struct capi_spi_transfer *transfer,
 				      void (*callback)(void*),
 				      void* callback_arg);
+
+/**
+ * @brief Async transfer single message using DMA
+ * @param device - The SPI device descriptor
+ * @param transfer - Transfer descriptor
+ * @param timeout - Timeout in milliseconds
+ * @return 0 in case of success, error codes otherwise
+ */
+
+int stm32_capi_spi_transceive_dma_async(struct capi_spi_device *device,
+		struct capi_spi_transfer *transfer,
+		int timeout);
 
 /**
  * @brief Sync transfer single message using DMA
