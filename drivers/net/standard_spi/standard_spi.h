@@ -55,11 +55,19 @@ enum standard_spi_timestamp_format {
 	STANDARD_SPI_TS_FORMAT_64B_1588
 };
 
-struct standard_spi_frame_buffer {
+struct standard_spi_init_param {
+	struct no_os_spi_desc *comm_desc;
+
+	/* The OASPI device uses Protected SPI for control transactions */
+	bool prote_spi;
+};
+
+struct  standard_spi_desc  {
 	struct capi_spi_device *comm_desc;
+	struct capi_spi_transfer *msg;
 	volatile enum standard_spi_buffer_state spi_state;
 	uint8_t num_ports;
-	bool crc_spi;
+	bool append_crc;
 	bool rx_queue_hp_en;
 	bool fcs_check_en; 
 	enum standard_spi_timestamp_format ts_format;
