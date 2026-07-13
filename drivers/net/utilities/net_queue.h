@@ -1,5 +1,5 @@
 /*******************************************************************************
-*   @file   adi_queue.h
+*   @file   net_queue.h
 *   @brief  Implementation of queue module for adin1110 driver.
 *   @author Christine Joy Murillo (Christinejoy.Murillo@analog.com)
 ********************************************************************************
@@ -35,8 +35,8 @@
  *  @{
  */
 
-#ifndef ADI_QUEUE_H
-#define ADI_QUEUE_H
+#ifndef NET_QUEUE_H
+#define NET_QUEUE_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -51,7 +51,7 @@ extern "C" {
 /*!
  * @brief Queue to hold frames.
  */
-struct adi_queue
+struct net_queue
 {	
 	/*!< Pointer to the entries in the queue */
     void *pEntries;  
@@ -70,7 +70,7 @@ struct adi_queue
 /*!
  * @brief Queue statistics counters.
  */
-struct adi_queue_stats_counter
+struct net_queue_stats_counter
 {	
 	/*!< Number of successful add operations */
     uint32_t enqueueSuccessCount;
@@ -89,29 +89,29 @@ struct adi_queue_stats_counter
 };
 
 /* Initializes the queue data structure */
-int queue_init (struct adi_queue *const queue_p, void *const pEntries,
+int net_queue_init (struct net_queue *const net_queue_p, void *const pEntries,
 	uint32_t numEntries);
 
 /* Gets the current number of frames in the queue */
-uint32_t queue_get_count (struct adi_queue *const queue_p);
+uint32_t net_queue_get_count (struct net_queue *const net_queue_p);
 
 /* Checks if the queue is full */
-bool queue_is_full (struct adi_queue *const queue_p);
-
-/* Checks if the queue is full */
-bool queue_is_empty (struct adi_queue *const queue_p);
+bool net_queue_is_full (struct net_queue *const net_queue_p);
 
 /* Checks if the queue is empty */
-uint32_t queue_get_avail_entries (struct adi_queue *const queue_p);
+bool net_queue_is_empty (struct net_queue *const net_queue_p);
+
+/* Gets the number of available entries in the queue */
+uint32_t net_queue_get_avail_entries (struct net_queue *const net_queue_p);
 
 /* Adds a frame to the queue by advancing the head pointer */
-void queue_add_entry (struct adi_queue *const queue_p);
+void net_queue_add_entry (struct net_queue *const net_queue_p);
 
 /* Removes a frame from the queue by advancing the tail pointer */
-void queue_remove_entry (struct adi_queue *const queue_p);
+void net_queue_remove_entry (struct net_queue *const net_queue_p);
 
 /* Gets the tail index of the queue without removing the entry */
-int queue_peek (struct adi_queue *const queue_p);
+int net_queue_peek (struct net_queue *const net_queue_p);
 
 
 /*! @endcond */
@@ -120,4 +120,4 @@ int queue_peek (struct adi_queue *const queue_p);
 }
 #endif
 
-#endif /* ADI_QUEUE_H */
+#endif /* net_queue_H */

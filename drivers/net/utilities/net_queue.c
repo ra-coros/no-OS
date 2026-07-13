@@ -1,5 +1,5 @@
 /*******************************************************************************
-*   @file   adi_queue.c
+*   @file   net_queue.c
 *   @brief  Implementation of queue module for adin1110 driver.
 *   @author Christine Joy Murillo (Christinejoy.Murillo@analog.com)
 ********************************************************************************
@@ -31,19 +31,20 @@
 * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 *******************************************************************************/
 
-#include "adi_queue.h"
+#include "net_queue.h"
 
 #define PSEUDO_MODULO(N, D) (((N) < (D)) ? (N) : ((N) - (D)))
 
-static uint32_t queueAvailable (struct adi_queue *const queue_p);
-static void queueAdd  (struct adi_queue *const queue_p);
-static void queueRemove (struct adi_queue *const queue_p);
-static bool queueIsFull (struct adi_queue *const queue_p);
-static bool queueIsEmpty (struct adi_queue *const queue_p);
-static uint32_t queuePeek  (struct adi_queue *const queue_p);
+static inline uint32_t queue_count(struct net_queue *const queue_p);
+static uint32_t queue_available(struct net_queue *const queue_p);
+static bool queue_full(struct net_queue *const queue_p);
+static bool queue_empty(struct net_queue *const queue_p);
+static void queue_add(struct net_queue *const queue_p);
+static void queue_remove(struct net_queue *const queue_p);
+static uint32_t queue_peek_entry(struct net_queue *const queue_p);
 
 
-static inline uint32_t queue_count(struct adi_queue *const queue_p)
+static inline uint32_t queue_count(struct net_queue *const queue_p)
 {   
 	uint32_t head = queue_p->head;
 	uint32_t tail = queue_p->tail;
@@ -52,36 +53,36 @@ static inline uint32_t queue_count(struct adi_queue *const queue_p)
 	return PSEUDO_MODULO(n, queue_p->numEntries);
 }
 
-static uint32_t queue_available(struct adi_queue *const queue_p)
+static uint32_t queue_available(struct net_queue *const queue_p)
 {  
-	return (queue_p->numEntries - 1) - queueCount(queue_p);
+	return (queue_p->numEntries - 1) - queue_count(queue_p);
 }
 
-static bool queue_full(struct adi_queue *const queue_p)
+static bool queue_full(struct net_queue *const queue_p)
 {   
-	return (queue_p->numEntries - 1) == queueCount(queue_p);
+	return (queue_p->numEntries - 1) == queue_count(queue_p);
 }
 
-static bool queue_empty(struct adi_queue *const queue_p)
+static bool queue_empty(struct net_queue *const queue_p)
 {
 	uint32_t head = queue_p->head;
 	uint32_t tail = queue_p->tail;    
 	return head == tail;
 }
 
-static void queue_add(struct adi_queue *const queue_p)
+static void queue_add(struct net_queue *const queue_p)
 {       
 	uint32_t n = queue_p->head + 1;
 	queue_p->head = PSEUDO_MODULO(n, queue_p->numEntries);
 }
 
-static void queue_remove(struct adi_queue *const queue_p)
+static void queue_remove(struct net_queue *const queue_p)
 {
 	uint32_t n = queue_p->tail + 1;
 	queue_p->tail = PSEUDO_MODULO(n, queue_p->numEntries);
 }
 
-static uint32_t queue_peek_entry(struct adi_queue *const queue_p)
+static uint32_t queue_peek_entry(struct net_queue *const queue_p)
 {
 	return queue_p->tail;
 }
@@ -106,7 +107,7 @@ static uint32_t queue_peek_entry(struct adi_queue *const queue_p)
  * @return 0 if initialization is successful.
  *         -EINVAL for invalid parameters.
  */
-int queue_init(struct adi_queue *const queue_p, 
+int net_queue_init(struct net_queue *const queue_p, 
 	void *const pEntries, uint32_t numEntries)
 {   
 	if (queue_p == NULL || pEntries == NULL || numEntries == 0)
@@ -128,7 +129,7 @@ int queue_init(struct adi_queue *const queue_p,
  * 
  * @return Current count of frames in the queue
  */
-uint32_t queue_get_count(struct adi_queue *const queue_p)
+uint32_t net_queue_get_count(struct net_queue *const queue_p)
 {
 	return queue_count(queue_p);
 }
@@ -141,9 +142,9 @@ uint32_t queue_get_count(struct adi_queue *const queue_p)
  * @return true if the queue is full.
  *         false if the queue is not full.
  */
-bool queue_is_full(struct adi_queue *const queue_p)
+bool net_queue_is_full(struct net_queue *const queue_p)
 {              
-	return queue_Full(queue_p);
+	return queue_full(queue_p);
 }
 
 /*!
@@ -154,9 +155,9 @@ bool queue_is_full(struct adi_queue *const queue_p)
  * @return true if the queue is empty.
  *         false if the queue is not empty.
  */
-bool queue_is_empty(struct adi_queue *const queue_p)
+bool net_queue_is_empty(struct net_queue *const queue_p)
 {
-	return queue_Empty(queue_p);
+	return queue_empty(queue_p);
 }
 
 /*!
@@ -166,7 +167,7 @@ bool queue_is_empty(struct adi_queue *const queue_p)
  * 
  * @return Number of available slots in the queue.
  */
-uint32_t queue_get_avail_entries(struct adi_queue *const queue_p)
+uint32_t net_queue_get_avail_entries(struct net_queue *const queue_p)
 {   
 	return queue_available(queue_p);
 }
@@ -177,7 +178,7 @@ uint32_t queue_get_avail_entries(struct adi_queue *const queue_p)
  * @param [in] queue_p   Constant pointer to the queue data structure.
  * 
  */
-void queue_add_entry(struct adi_queue *const queue_p)
+void net_queue_add_entry(struct net_queue *const queue_p)
 {   
 	queue_add(queue_p);
 }
@@ -188,7 +189,7 @@ void queue_add_entry(struct adi_queue *const queue_p)
  * @param [in] queue_p   Constant pointer to the queue data structure.
  * 
  */
-void queue_remove_entry(struct adi_queue *const queue_p)
+void net_queue_remove_entry(struct net_queue *const queue_p)
 {   
 	queue_remove(queue_p);
 }
@@ -201,9 +202,9 @@ void queue_remove_entry(struct adi_queue *const queue_p)
  * @return Tail index of the queue entry to peek at.
  *         Returns 0 if queue is empty (which is the valid tail position).
  */
-uint32_t queue_peek(struct adi_queue *const queue_p)
+uint32_t net_queue_peek(struct net_queue *const queue_p)
 {   
-	if (queue_isEmpty(queue_p))
+	if (queue_empty(queue_p))
 		return 0;
 	else
 		return queue_peek_entry(queue_p);
