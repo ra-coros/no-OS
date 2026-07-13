@@ -176,7 +176,14 @@ static int spi_fifo_write_start(struct standard_spi_frame_buffer *desc)
 	//do the FIFO write start transaction
 	//if blocking, wait for the transaction to complete
 	//if non-blocking, return and let the interrupt handler handle the rest
-
+	if (ret != 0)
+	{
+		desc->spi_state = STANDARD_SPI_STATE_READY;
+	}
+	else
+	{
+		desc->spi_state = STANDARD_SPI_STATE_FIFO_WRITE_END;
+	}
 	return ret;
 }
 
@@ -189,6 +196,11 @@ static int spi_fifo_write_end(struct standard_spi_frame_buffer *desc)
 	//if non-blocking, return and let the interrupt handler handle the rest
 
 	return ret;
+}
+
+void *standard_spi_callback(struct standard_spi_frame_buffer *desc)
+{
+	standard_spi_state_machine(&desc);
 }
 
 static int standard_spi_state_machine(struct standard_spi_frame_buffer *desc)
@@ -219,12 +231,9 @@ static int standard_spi_state_machine(struct standard_spi_frame_buffer *desc)
 	break;
 	}
 
-
 	if ((!desc->blocking) || (!desc->pending_control)) {
-		desc->spi_state = STANDARD_SPI_STATE_READY;
-		//enable the interrupt for the next transaction
+		//enable_interrupts();
 	}
-
+	desc->spi_state = STANDARD_SPI_STATE_READY;
 	return ret;
-
 } 
