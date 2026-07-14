@@ -111,7 +111,7 @@ void net_queue_add_entry (struct net_queue *const net_queue_p);
 void net_queue_remove_entry (struct net_queue *const net_queue_p);
 
 /* Gets the tail index of the queue without removing the entry */
-int net_queue_peek (struct net_queue *const net_queue_p);
+uint32_t net_queue_peek (struct net_queue *const net_queue_p);
 
 
 /*! @endcond */
