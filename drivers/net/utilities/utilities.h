@@ -37,6 +37,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#define ADI_FRAME_HEADER_SIZE               (2)
+
 /*!
  * @brief RX FIFO priority levels for the MAC interface.
  */
