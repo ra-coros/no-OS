@@ -137,17 +137,18 @@ enum standard_spi_timestamp_format {
 struct  standard_spi_desc  {
 	struct capi_spi_device *comm_desc;
 	volatile enum standard_spi_buffer_state spi_state;
-	uint8_t num_ports;
+	int device;
 	bool is_crc_enabled;
 	bool rx_queue_hp_en;
 	bool fcs_check_en; 
 	enum standard_spi_timestamp_format ts_format;
 	void *app_device;
-	net_queue *tx_queue; /*placeholder */
-	net_queue **rx_queue; /*placeholder */
-	net_queue *rx_queue_lp; /*placeholder */
-	net_queue *rx_queue_hp; /*placeholder */
+	net_queue *tx_queue; 
+	net_queue **rx_queue; 
+	net_queue *rx_queue_lp; 
+	net_queue *rx_queue_hp;
 	bool blocking;
+	eth_frame_struct *frame_entries;
 	uint32_t register_address;
 	uint8_t *data;
 	uint32_t *byte_size;
