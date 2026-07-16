@@ -261,6 +261,18 @@ int capi_spi_transceive(struct capi_spi_device *device,
  */
 int capi_spi_transceive_async(struct capi_spi_device *device,
 			      struct capi_spi_transfer *transfer);
+				  
+/**
+ * @brief Async/Non-Blocking DMA transceive function.
+ *
+ * @param [in] device Points to the SPI target-device configuration/descriptor
+ * @param [in] transfer Points to the SPI transfer
+ *
+ * @return int 0 for success or error code.
+ */
+
+int capi_spi_transceive_dma_async(struct capi_spi_device *device,
+			      struct capi_spi_transfer *transfer);
 
 /**
  * @brief Sync/Blocking read command style transceive function.

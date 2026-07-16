@@ -3,7 +3,7 @@
  *   @brief  Header file for the Standard SPI driver.
  *   @author Ra Coros (ra.coros@analog.com)
  ********************************************************************************
- * Copyright 2025(c) Analog Devices, Inc.
+ * Copyright 2026(c) Analog Devices, Inc.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -33,10 +33,12 @@
 #ifndef _NO_OS_STANDARD_SPI_H
 #define _NO_OS_STANDARD_SPI_H
 
-#include "platform/stm32/stm32_capi_spi.h"
+
 #include "no_os_util.h"
-#include "utilities/utilities.h"
-#include "utilities/net_queue.h"
+#include "utilities.h"
+#include "net_queue.h"
+#include "capi_spi.h"
+#include "stm32_capi_spi.h"
 #include <stdint.h>
 
 /*! SPI duplex selection. */
@@ -65,7 +67,7 @@
 #define ADI_SPI_TX_FIFO_BUFFER              (4)
 
 /*! Size of the SPI device                              */
-#define ADI_SPI_DEVICE_SIZE                 (sizeof(adi_adin_spi_device_t))
+#define ADI_SPI_DEVICE_SIZE                 (sizeof(struct standard_spi_desc))
 /*! Size of timestamp in bytes                         */
 #define ADI_TIMESTAMP_BYTE_SIZE             (8)
 
@@ -73,7 +75,7 @@
 
 #define SPI_TX_HEADER                       (2)
 
-#define SPI_COMMS_TIMEOUT_MS               (50)
+#define SPI_COMMS_TIMEOUT_US               (50000U)
 
 
 /*! Maximum number of iterations to wait for the SPI transaction to finish. */
@@ -90,6 +92,14 @@
 
 /*! SPI header value indicating a write transaction.    */
 #define ADI_MAC_SPI_WRITE                  (1)
+
+#define ADI_FRAME_HEADER_SIZE              (2)
+
+/*! Frame Check Sequence size in bytes (CRC32). */
+#define FCS_SIZE                            (4)
+
+/*! MAC event: dynamic forwarding table update. */
+#define ADI_MAC_EVT_DYN_TBL_UPDATE          (0)
 
 /*!
  * @brief SPI header.
@@ -137,25 +147,75 @@ enum standard_spi_timestamp_format {
 struct  standard_spi_desc  {
 	struct capi_spi_device *comm_desc;
 	volatile enum standard_spi_buffer_state spi_state;
-	int device;
-	bool is_crc_enabled;
+	void *device;
+	bool crc_en;
 	bool rx_queue_hp_en;
-	bool fcs_check_en; 
+	bool fcs_check_en;
+	eth_callback_t cb_func[1];
+	void **cb_param; 
 	enum standard_spi_timestamp_format ts_format;
 	void *app_device;
-	net_queue *tx_queue; 
-	net_queue **rx_queue; 
-	net_queue *rx_queue_lp; 
-	net_queue *rx_queue_hp;
+	struct net_queue *tx_queue;
+	struct net_queue **rx_queue;
+	struct net_queue *rx_queue_lp;
+	struct net_queue *rx_queue_hp;
 	bool blocking;
-	eth_frame_struct *frame_entries;
+	struct eth_frame_struct *frame_entries;
 	uint32_t register_address;
 	uint8_t *data;
 	uint32_t *byte_size;
-	bool pending_control;
+	volatile bool *pending_control;
 	volatile uint32_t spi_error;
+	uint32_t eth_irq_num;
 };
 
+struct standard_spi_init_param {
+	struct capi_spi_device *comm_param;
+	void *dev_mem;
+	uint32_t dev_mem_size;
+	bool crc_en;
+	bool rx_queue_hp_en;
+	bool fcs_check_en;
+	void *app_device;
+	struct net_queue *tx_queue;
+	struct net_queue **rx_queue;
+	struct net_queue *rx_queue_lp;
+	struct net_queue *rx_queue_hp;
+	uint32_t eth_irq_num;
+};
 
+int standard_spi_reg_read(struct standard_spi_desc *desc,
+			       uint16_t register_address,
+			       void *data,
+			       uint32_t *byte_size,
+			       bool blocking);
+
+int standard_spi_reg_write(struct standard_spi_desc *desc,
+			       uint16_t register_address,
+			       void *data,
+			       uint32_t *byte_size,
+			       bool blocking);
+
+int standard_spi_fifo_read(struct standard_spi_desc *desc,
+			       uint16_t register_address,
+			       void *data,
+			       uint32_t *byte_size,
+			       bool blocking);
+
+int standard_spi_init(struct standard_spi_desc **desc,
+		      struct standard_spi_init_param *param);
+
+int standard_spi_remove(struct standard_spi_desc *desc);
+
+int standard_spi_fifo_write(struct standard_spi_desc *desc,
+			       struct eth_frame_struct *frame,
+			       bool blocking);
+
+int is_spi_ready(struct standard_spi_desc *desc);
+int standard_spi_get_status(struct standard_spi_desc *desc,
+			    uint8_t *backup, bool control);
+
+void standard_spi_callback(enum capi_async_event event, void *arg,
+			   int event_extra);
 
 #endif /* _NO_OS_STANDARD_SPI_H */

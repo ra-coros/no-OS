@@ -35,25 +35,25 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include "capi_time.h"
 #include "no_os_crc8.h"
 #include "no_os_alloc.h"
+
+#include "capi_spi.h"
+#include "capi_irq.h"
+#include "stm32_capi_spi.h"
+#include "stm32_capi_irq.h"
+#include "net_queue.h"
+
 #include "standard_spi.h"
-#include "utilities/net_queue.h"
+
 
 static uint8_t spi_tx_buf[BUFFERSIZE + 2] __attribute__((aligned(4)));
 static uint8_t spi_rx_buf[BUFFERSIZE + 2] __attribute__((aligned(4)));
 
-
-static int standard_spi_write(standard_spi_desc *desc, adi_mac_State_e spiState, uint16_t regAddr, void *pBuf, uint32_t nBytes, bool blocking);
-static int standard_spi_read(standard_spi_desc *desc, adi_mac_State_e spiState, uint16_t regAddr, void *pBuf, uint32_t nBytes, bool blocking);
-static int standard_spi_write_frame(standard_spi_desc *desc, adi_mac_FrameStruct_t *frame,bool blocking);
-static int standard_spi_irq_handler(standard_spi_desc *desc);
-static int standard_spi_get_status(standard_spi_desc *desc, uint8_t *backup, bool bIsCtrl);
-static int spi_wait (standard_spi_desc *desc);
-
-static int adiAdinSpiWrite(standard_spi_desc *desc, uint16_t regAddr, void *pBuf, uint32_t nBytes, bool blocking);
-static int adiAdinSpiRead(standard_spi_desc *desc, uint16_t regAddr, void *pBuf, uint32_t nBytes, bool blocking);
+static int standard_spi_state_machine(struct standard_spi_desc *desc);
 static uint8_t crc_block8(uint8_t *start_address, uint32_t byte_size, uint32_t bits_size, bool lsb_first);
+
 
 /* CRC-8/CCITT MSB-first LUT (poly=0x07, seed=0x00) */
 static const uint8_t crc8_be_lut[256] = {
@@ -128,60 +128,63 @@ static const uint8_t crc8_le_lut[256] = {
 };
 
 int standard_spi_init(struct standard_spi_desc **desc,
-		    const struct standard_spi_init_param *param)
+                      struct standard_spi_init_param *param)
 {
-    int result = ADI_ETH_SUCCESS;
-    standard_spi_desc   *desc;
+    int ret = 0;
+    struct standard_spi_desc *d;       /* no shadow */
 
-    
-    if (phDevice == NULL || cfg == NULL) 
-        return ADI_ETH_INVALID_HANDLE;
+    if (!desc || !param)
+        return -EINVAL;
 
-    if (cfg->devMemSize < sizeof(standard_spi_desc))
-    {
-        return ADI_ETH_INVALID_PARAM;
-    }
+    if (param->dev_mem_size < sizeof(struct standard_spi_desc))
+        return -EINVAL;
 
-    memset(cfg->pDevMem, 0, cfg->devMemSize);
+    memset(param->dev_mem, 0, param->dev_mem_size);
+    *desc = (struct standard_spi_desc *)param->dev_mem;  /* caller gets the pointer */
+    d = *desc;                                           
 
-    *phDevice = (standard_spi_desc *)cfg->pDevMem;
-    desc = *phDevice;
-    
+    d->comm_desc = param->comm_param;
+    d->device = param->app_device;
     /* Implies state is uninitialized */
-    desc->isRxQueueHpEnabled = cfg->isRxQueueHpEnabled;
-    desc->fcsCheckEn = cfg->fcsCheckEn;
-    desc->bIsCrcEnabled = cfg->isCrcEnabled;
-    desc->device = cfg->appDeviceType;
-    desc->timestampFormat = ADI_MAC_TS_FORMAT_NONE;
-    
-    desc->spiState = ADI_SPI_STATE_READY;
-    desc->spiErr = 0;
+    d->rx_queue_hp_en = param->rx_queue_hp_en;
+    d->fcs_check_en = param->fcs_check_en;
+    d->crc_en = param->crc_en;
+    d->ts_format = STANDARD_SPI_TS_FORMAT_NONE;
 
-    desc->adiSpiDriverAccess = &adinSpiDriverEntry;
-	return result;
+    d->spi_state = STANDARD_SPI_STATE_READY;
+    d->spi_error = 0;
+    d->eth_irq_num = param->eth_irq_num;
+
+	return ret;
 }
 
 int standard_spi_remove(struct standard_spi_desc *desc)
 {
-	return 0;
+    if (!desc)
+        return -EINVAL;
+
+    desc->spi_state = STANDARD_SPI_STATE_READY;
+    desc->comm_desc = NULL;
+    memset(desc, 0, sizeof(struct standard_spi_desc));
+
+    return 0;
 }
 
-static int is_spi_ready(standard_spi_desc *desc)
+int is_spi_ready(struct standard_spi_desc *desc)
 {
     /* Already ready, return immediately */
-    if (desc->spiState == ADI_SPI_STATE_READY)
-        return ADI_ETH_SUCCESS;
+    if (desc->spi_state == STANDARD_SPI_STATE_READY)
+        return 0;
     
-    /* Wait for SPI state to be ready*/
-    uint32_t startTime = HAL_GetTick();
-    while (desc->spiState != ADI_SPI_STATE_READY) {
-        /* Check if timeout is greater than 50, communication timeout.
-           Otherwise, the SPI state is ready.                       */
-        if ((HAL_GetTick() - startTime) >= SPI_COMMS_TIMEOUT_MS)
-            return ADI_ETH_COMM_TIMEOUT;
+    /* Wait for SPI state to be ready */
+    uint64_t start_us, now_us;
+    capi_uptime(&start_us);
+    while (desc->spi_state != STANDARD_SPI_STATE_READY) {
+        capi_uptime(&now_us);
+        if ((now_us - start_us) >= (uint64_t)SPI_COMMS_TIMEOUT_US)
+            return -ETIMEDOUT;
     }
-    
-    return ADI_ETH_SUCCESS;
+    return 0;
 }
 
 int standard_spi_reg_read(struct standard_spi_desc *desc,
@@ -190,7 +193,7 @@ int standard_spi_reg_read(struct standard_spi_desc *desc,
 			       uint32_t *byte_size,
 			       bool blocking)
 {
-    if (desc == NULL || data == NULL || byte_size == NULL)
+    if (!desc || !data || !byte_size)
         return -EINVAL;
     
     if (desc->spi_state != STANDARD_SPI_STATE_READY)
@@ -211,11 +214,15 @@ int standard_spi_reg_write(struct standard_spi_desc *desc,
 			       uint32_t *byte_size,
 			       bool blocking)
 {
-    if (desc == NULL || data == NULL || byte_size == NULL)
+    if (!desc || !data || !byte_size)
         return -EINVAL;
     
     if (desc->spi_state != STANDARD_SPI_STATE_READY)
         return -EBUSY;
+
+    /* 0x031 is MAC FIFO write address */
+    if (register_address == 0x031)
+        return -EINVAL;
 
     desc->register_address = register_address;
     desc->data = (uint8_t *)data;
@@ -232,7 +239,7 @@ int standard_spi_fifo_read(struct standard_spi_desc *desc,
 			       uint32_t *byte_size,
 			       bool blocking)
 {
-    if (desc == NULL || data == NULL || byte_size == NULL)
+    if (!desc || !data || !byte_size)
         return -EINVAL;
     
     if (desc->spi_state != STANDARD_SPI_STATE_READY)
@@ -248,10 +255,10 @@ int standard_spi_fifo_read(struct standard_spi_desc *desc,
 }
 
 int standard_spi_fifo_write(struct standard_spi_desc *desc,
-			       eth_frame_struct *frame,
+			       struct eth_frame_struct *frame,
 			       bool blocking)
 {
-    if (desc == NULL || frame == NULL)
+    if (!desc || frame == NULL)
         return -EINVAL;
     
     if (desc->spi_state != STANDARD_SPI_STATE_READY)
@@ -269,13 +276,13 @@ static int spi_register_read(struct standard_spi_desc *desc)
     int ret = 0;
     uint32_t fill_count = 0;
     uint32_t byte_count = 0;
-    eth_frame_header spi_header;
+    eth_mac_header spi_header;
     uint32_t data_counter = 0;
     uint8_t index = 0;
     uint32_t data_offset  = (uint32_t)SPI_TX_HEADER + 1;
     struct capi_spi_transfer xfer;
 
-    if (desc == NULL)
+    if (!desc)
         return -EINVAL;
 
     /* Todo: Should this account for CRC/turnaround bytes? */
@@ -292,7 +299,7 @@ static int spi_register_read(struct standard_spi_desc *desc)
     spi_tx_buf[index++] = spi_header.VALUE16 >> 8;
     spi_tx_buf[index++] = spi_header.VALUE16 & 0xFF;
 
-    if (desc->is_crc_enabled)
+    if (desc->crc_en)
     {
         spi_tx_buf[index] = crc_block8(spi_tx_buf, (uint32_t)ADI_SPI_HEADER_SIZE, 0, false);
         fill_count = ((byte_count) + (byte_count / ADI_MAC_SPI_ACCESS_SIZE)) + 1; 
@@ -331,12 +338,12 @@ static int spi_register_read(struct standard_spi_desc *desc)
     if (desc->blocking) 
     {
         /* 1 is the turnaround byte */
-        if (desc->is_crc_enabled)
+        if (desc->crc_en)
         {
             data_offset++;
         }
-        if (!desc->is_crc_enabled) {
-            memcpy(desc->data, &spi_rx_buf[data_offset], byte_count);             
+        if (!desc->crc_en) {
+            memcpy(desc->data, &spi_rx_buf[data_offset], *(desc->byte_size));             
         } else {
             for (uint32_t i  = data_offset; i < data_offset + fill_count - 1; i += (ADI_MAC_SPI_ACCESS_SIZE + 1))
             {
@@ -344,7 +351,7 @@ static int spi_register_read(struct standard_spi_desc *desc)
                 {
                     return -EINVAL;
                 }
-                *(ADI_MAC_SPI_ACCESS_UNIT_TYPE *)&desc->data[data_counter] = *(ADI_MAC_SPI_ACCESS_UNIT_TYPE *)&spi_rx_buf[i];
+                *(uint32_t *)&desc->data[data_counter] = *(uint32_t *)&spi_rx_buf[i];
                 data_counter += ADI_MAC_SPI_ACCESS_SIZE;
             }
         }
@@ -357,12 +364,12 @@ static int spi_register_write(struct standard_spi_desc *desc)
     int ret = 0;
     uint8_t             index = 0;
     uint32_t            byte_offset = (uint32_t)ADI_SPI_HEADER_SIZE;
-    uint32_t            byte_count = desc->byte_size;
-    eth_frame_header    spi_header;
+    uint32_t            byte_count = *desc->byte_size;
+    eth_mac_header    spi_header;
     uint8_t             tmp_crc = 0;
     struct capi_spi_transfer xfer;
 
-    if (desc == NULL)
+    if (!desc)
     {
         return -EINVAL;
     }
@@ -376,37 +383,37 @@ static int spi_register_write(struct standard_spi_desc *desc)
     spi_header.FD = ADI_MAC_SPI_HALF_DUPLEX;
     spi_header.RW = ADI_MAC_SPI_WRITE;
     spi_header.ADDR = desc->register_address;
-    tx_buf[index++] = spi_header.VALUE16 >> 8;
-    tx_buf[index++] = spi_header.VALUE16 & 0xFF;
+    spi_tx_buf[index++] = spi_header.VALUE16 >> 8;
+    spi_tx_buf[index++] = spi_header.VALUE16 & 0xFF;
 
-    if (desc->is_crc_enabled)
+    if (desc->crc_en)
     {
-        tx_buf[index] = crc_block8(tx_buf, (uint32_t)ADI_SPI_HEADER_SIZE, 0, false);
-        byte_count = ((desc->byte_size) + (desc->byte_size / ADI_MAC_SPI_ACCESS_SIZE)) + 1;
+        spi_tx_buf[index] = crc_block8(spi_tx_buf, (uint32_t)ADI_SPI_HEADER_SIZE, 0, false);
+        byte_count = ((*desc->byte_size) + (*desc->byte_size / ADI_MAC_SPI_ACCESS_SIZE)) + 1;
         
         for (uint32_t i = 1, j = 0, chunk_count = 0; i < byte_count; i++) {
             if (chunk_count == ADI_MAC_SPI_ACCESS_SIZE) {
                 tmp_crc = crc_block8((desc->data + (j - ADI_MAC_SPI_ACCESS_SIZE)), 
                             ADI_MAC_SPI_ACCESS_SIZE, 0, false);
-                tx_buf[i + byte_offset] = tmp_crc;
+                spi_tx_buf[i + byte_offset] = tmp_crc;
                 chunk_count = 0;
             } else {
-                tx_buf[i + byte_offset] = desc->data[j++];
+                spi_tx_buf[i + byte_offset] = desc->data[j++];
                 chunk_count++;
             }
         }
     } else {
         for (uint32_t i = 0u; i < byte_count  ; i++)
         {
-            tx_buf[i + byte_offset] = desc->data[i];
+            spi_tx_buf[i + byte_offset] = desc->data[i];
         }      
     }
 
     byte_count = byte_count + byte_offset;
-    desc->byte_size = &byte_count;
+    *desc->byte_size = byte_count;
 
-    xfer.tx_buf = tx_buf;
-    xfer.rx_buf = desc->data;
+    xfer.tx_buf = spi_tx_buf;
+    xfer.rx_buf = spi_rx_buf;
     xfer.tx_size = byte_count;
     xfer.rx_size = byte_count;
     xfer.timeout = 0;
@@ -427,23 +434,23 @@ static int spi_fifo_read_start(struct standard_spi_desc *desc)
     int ret = 0;
     uint32_t fill_count = 0;
     uint32_t byte_count = 0;
-    eth_frame_header spi_header;
-    uint32_t data_counter = 0;
+    eth_mac_header spi_header;
     uint8_t index = 0;
-    uint32_t data_offset  = (uint32_t)SPI_TX_HEADER + 1;
-    net_queue *rx_queue   = *desc->rx_queue;
-    eth_frame_struct *frame_entries = rx_queue->frame_entries;
+    struct net_queue *rx_queue;
+    struct eth_frame_struct *frame_entries;
 
     struct capi_spi_transfer xfer;
 
-    if (desc == NULL)
+    if (!desc)
         return -EINVAL;
 
     /* Todo: Should this account for CRC/turnaround bytes? */
     if (*(desc->byte_size) > (BUFFERSIZE - 2)) {
       return -EINVAL;
     }
-    
+
+    rx_queue = *desc->rx_queue;
+    frame_entries = (struct eth_frame_struct *)rx_queue->pEntries;
     byte_count = *(desc->byte_size);
 
     spi_header.CD = (uint16_t)ADI_MAC_SPI_TRANSACTION_CONTROL;
@@ -453,7 +460,7 @@ static int spi_fifo_read_start(struct standard_spi_desc *desc)
     spi_tx_buf[index++] = spi_header.VALUE16 >> 8;
     spi_tx_buf[index++] = spi_header.VALUE16 & 0xFF;
 
-    if (desc->is_crc_enabled)
+    if (desc->crc_en)
     {
         spi_tx_buf[index] = crc_block8(spi_tx_buf, (uint32_t)ADI_SPI_HEADER_SIZE, 0, false);
         fill_count = byte_count + 1; 
@@ -485,25 +492,25 @@ static int spi_fifo_read_start(struct standard_spi_desc *desc)
     xfer.xfer_delay_clk_cycles = 0;
     
     desc->spi_state = STANDARD_SPI_STATE_FIFO_READ_END;	
-	ret = stm32_capi_spi_transceive_dma_async(desc->comm_desc, &xfer);
+	ret = stm32_capi_spi_transceive_dma_async(desc->comm_desc, &xfer,10000);
     return ret;
 }
 
 void spi_fifo_read_end(struct standard_spi_desc *desc)
 {
     uint32_t           tail;
-    eth_frame_header   header;
+    struct eth_frame_header   header;
     uint32_t           byte_offset;
     uint8_t            *rx_buf;
     uint32_t           expected_fcs = 0;
     uint8_t            timestamp_bytes[ADI_TIMESTAMP_BYTE_SIZE];
     uint32_t           actual_fcs;
-    mac_rx_fifo_prio   prio;
-    net_queue          *tx_queue;
-    net_queue          *rx_queue;
-    eth_frame_struct   *frame_entries;
+    enum mac_rx_fifo_prio prio;
+    struct net_queue   *tx_queue;
+    struct net_queue   *rx_queue;
+    struct eth_frame_struct *frame_entries;
 
-    if (desc == NULL)
+    if (!desc)
 		return;
 
     rx_queue  = *desc->rx_queue;
@@ -511,15 +518,18 @@ void spi_fifo_read_end(struct standard_spi_desc *desc)
 
     byte_offset = (uint32_t)ADI_SPI_HEADER_SIZE + 1;
 
-    if (desc->is_crc_enabled)
+    if (desc->crc_en)
         byte_offset++;
     
-    header = *(eth_frame_header *)&spi_rx_buf[byte_offset];
-    header.VALUE16 = HTON16(header.VALUE16);
-    prio = (mac_rx_fifo_prio)header.PRI;
+    frame_entries  = (struct eth_frame_struct *)rx_queue->pEntries;
+    rx_buf = frame_entries[rx_queue->tail].buf_desc->buf;
+    header = *(struct eth_frame_header *)&spi_rx_buf[byte_offset];
+    header.VALUE16 = no_os_bswap_constant_16(header.VALUE16);
+    
+    prio = (enum mac_rx_fifo_prio)header.PRI;
 
     if (desc->rx_queue_hp_en) {
-        if (prio == ADI_MAC_RX_FIFO_PRIO_LOW) {
+        if (prio == MAC_RX_FIFO_PRIO_LOW) {
             (*(desc->rx_queue)) = &*(desc->rx_queue_lp);
         } else {
             (*(desc->rx_queue)) = &*(desc->rx_queue_hp);
@@ -533,28 +543,28 @@ void spi_fifo_read_end(struct standard_spi_desc *desc)
         if (header.TIME_STAMP_PRESENT) {
             if (desc->ts_format == STANDARD_SPI_TS_FORMAT_64B_1588) {
                 /* 64-bit timestamps. */
-               frame_entries[rx_queue->tail].buf_desc->timestamp_ext = HTON32((*(uint32_t *)&spi_rx_buf[byte_offset]));
+               frame_entries[rx_queue->tail].buf_desc->timestamp_ext = no_os_bswap_constant_32((*(uint32_t *)&spi_rx_buf[byte_offset]));
                memcpy(&timestamp_bytes[4], &spi_rx_buf[byte_offset], 4);
                byte_offset += 4;
                     
-               frame_entries[rx_queue->tail].buf_desc->timestamp = HTON32((*(uint32_t *)&spi_rx_buf[byte_offset]));
+               frame_entries[rx_queue->tail].buf_desc->timestamp = no_os_bswap_constant_32((*(uint32_t *)&spi_rx_buf[byte_offset]));
                 memcpy(&timestamp_bytes[0], &spi_rx_buf[byte_offset], 4);
                 byte_offset += 4;
                     
                frame_entries[rx_queue->tail].buf_desc->trx_size -= 8;
 
                 /* MAC_CalculateParity returns 1 if timestamp_bytes has odd parity, and TIME_STAMP_PARITY is 0 if timestamp_bytes has odd parity. */
-               frame_entries[rx_queue->tail].buf_desc->timestamp_valid = (SPI_CalculateParity(timestamp_bytes, 8, 0) != header.TIME_STAMP_PARITY);
+               frame_entries[rx_queue->tail].buf_desc->timestamp_valid = (calculate_parity(timestamp_bytes, 8, 0) != header.TIME_STAMP_PARITY);
             } else {
                 /* 32-bit timestamps. */
                frame_entries[rx_queue->tail].buf_desc->timestamp_ext = 0;
-               frame_entries[rx_queue->tail].buf_desc->timestamp = HTON32((*(uint32_t *)&spi_rx_buf[byte_offset]));
+               frame_entries[rx_queue->tail].buf_desc->timestamp = no_os_bswap_constant_32((*(uint32_t *)&spi_rx_buf[byte_offset]));
                memcpy(&timestamp_bytes[0], &spi_rx_buf[byte_offset], 4);
                
                byte_offset += 4;
                frame_entries[rx_queue->tail].buf_desc->trx_size -= 4;
                /* MAC_CalculateParity returns 1 if timestamp_bytes has odd parity, and TIME_STAMP_PARITY is 0 if timestamp_bytes has odd parity. */
-               frame_entries[*(desc->rx_queue)->tail].buf_desc->timestamp_valid = (calculate_parity(timestamp_bytes, 4, 0) != header.TIME_STAMP_PARITY);
+               frame_entries[(*desc->rx_queue)->tail].buf_desc->timestamp_valid = (calculate_parity(timestamp_bytes, 4, 0) != header.TIME_STAMP_PARITY);
             }
         }
         
@@ -564,7 +574,7 @@ void spi_fifo_read_end(struct standard_spi_desc *desc)
         frame_entries[rx_queue->tail].buf_desc->trx_size -= FCS_SIZE;
         frame_entries[rx_queue->tail].buf_desc->prio = prio;
         
-        if (desc->device == 1)
+        if (desc->device == (void *)1)
             frame_entries[rx_queue->tail].buf_desc->port = header.PORT;
 
         if (desc->fcs_check_en) {
@@ -573,37 +583,38 @@ void spi_fifo_read_end(struct standard_spi_desc *desc)
 
             if (expected_fcs != actual_fcs)
                 desc->spi_error |= 1 << 0;
-            
         }
-            tail = rx_queue->tail;
-            net_queue_remove_entry(rx_queue);
+        
+        tail = rx_queue->tail;
+        net_queue_remove_entry(rx_queue);
 
-        if (desc->device == 1 && 
+        if (desc->device == (void *)1 && 
             desc->cb_func[ADI_MAC_EVT_DYN_TBL_UPDATE] != NULL) 
-                desc->cb_func[ADI_MAC_EVT_DYN_TBL_UPDATE]((desc->app_device_type), 
+                desc->cb_func[ADI_MAC_EVT_DYN_TBL_UPDATE]((desc->app_device), 
                 desc->spi_error, frame_entries[tail].buf_desc);
 
         if (frame_entries[tail].buf_desc->cb_func)
         {
-            frame_entries[tail].buf_desc->cb_func((desc->app_device_type), desc->spi_error, frame_entries[tail].buf_desc);
+            frame_entries[tail].buf_desc->cb_func((desc->app_device), desc->spi_error, frame_entries[tail].buf_desc);
         }
     }
 
     if (net_queue_is_empty(tx_queue))
-        // HAL_SetPendingIrq
+        stm32_capi_irq_set_pending(desc->eth_irq_num);
 }
 
-static int spi_fifo_write_start(standard_spi_desc *desc)
+static int spi_fifo_write_start(struct standard_spi_desc *desc)
 {
     uint32_t                byte_count;
-    eth_frame_header        spi_header;
+    eth_mac_header        spi_header;
     uint32_t                index = 0;
     uint32_t                frame_header_size = (uint32_t)ADI_FRAME_HEADER_SIZE;
     uint32_t                spi_header_size = (uint32_t)ADI_SPI_HEADER_SIZE;
-    uint8_t                 ret = 0;
-    eth_frame_struct        *frame;
+    int                     ret = 0;
+    struct eth_frame_struct        *frame;
+    struct capi_spi_transfer xfer;
     
-    if (desc == NULL)
+    if (!desc)
     { 
         return -EINVAL;
     }
@@ -611,7 +622,7 @@ static int spi_fifo_write_start(standard_spi_desc *desc)
     frame = desc->frame_entries;
     byte_count = frame->buf_desc->trx_size + frame_header_size + spi_header_size;
     /* If SPI CRC is enabled, we have an extra byte for CRC. */
-    if (desc->is_crc_enabled)
+    if (desc->crc_en)
     {
         byte_count++;
     }
@@ -625,14 +636,14 @@ static int spi_fifo_write_start(standard_spi_desc *desc)
     spi_header.CD = ADI_MAC_SPI_TRANSACTION_CONTROL;
     spi_header.FD = ADI_MAC_SPI_HALF_DUPLEX;
     spi_header.RW = ADI_MAC_SPI_WRITE;
-    spi_header.ADDR = 0x031U; /* SPI FIFO write address */
+    spi_header.ADDR = 0x031; /* SPI FIFO write address */
 
     spi_tx_buf[index++] = spi_header.VALUE16 >> 8;
     spi_tx_buf[index++] = spi_header.VALUE16 & 0xFF;
 
     /* If SPI CRC is enabled, add it for the SPI header. Note there is no CRC */
     /* for rest of the transaction (frame header + frame). */
-    if (desc->is_crc_enabled)
+    if (desc->crc_en)
     {
         spi_tx_buf[index++] = crc_block8(&spi_tx_buf[0], (uint32_t)ADI_SPI_HEADER_SIZE, 0, false);
     }
@@ -658,23 +669,22 @@ static int spi_fifo_write_start(standard_spi_desc *desc)
     xfer.timeout = 0;
     xfer.xfer_delay_clk_cycles = 0;
     
-    desc->spi_state = STANDARD_SPI_STATE_FIFO_READ_END;	
-	ret = stm32_capi_spi_transceive_dma_async(desc->comm_desc, &xfer);
+    desc->spi_state = STANDARD_SPI_STATE_FIFO_WRITE_END;	
+	ret = stm32_capi_spi_transceive_dma_async(desc->comm_desc, &xfer,10000);
     return ret;
 }
 
-static void spi_fifo_write_end(standard_spi_desc *desc)
+static void spi_fifo_write_end(struct standard_spi_desc *desc)
 {
     uint32_t tail;
-    eth_frame_struct *frame_entries;
-    (void)pArg;
+    struct eth_frame_struct *frame_entries;
 
-    if (desc == NULL)
+    if (!desc)
 		return;
     
     tail = desc->tx_queue->tail;
     net_queue_remove_entry(&*(desc->tx_queue));
-    frame_entries = desc->tx_queue->frame_entries;
+    frame_entries = (struct eth_frame_struct *)desc->tx_queue->pEntries;
 
     /* Decrement the reference count, and call the callback function only if the reference  */
     /* count is 0. This ensures that if the intent was to send the buffer to both ports, it */
@@ -682,43 +692,41 @@ static void spi_fifo_write_end(standard_spi_desc *desc)
     frame_entries[tail].buf_desc->ref_count--;
     if (frame_entries[tail].buf_desc->cb_func && 
         (!frame_entries[tail].buf_desc->ref_count)) 
-        frame_entries[tail].buf_desc->cb_func((desc->appDevice),
+        frame_entries[tail].buf_desc->cb_func((desc->app_device),
         desc->spi_error, 
         frame_entries[tail].buf_desc);
 }
 
-static int standard_spi_irq_handler(standard_spi_desc *desc)
+int standard_spi_get_status(struct standard_spi_desc *desc,
+			   uint8_t *backup, bool control)
 {
-    return -1;
-}
-
-static int standard_spi_get_status(standard_spi_desc *desc, uint8_t *status, bool control)
-{
-	int ret = 0;
-
-    if (desc == NULL)
-        return -EINVAL;
+	if (!desc)
+		return -EINVAL;
 
 	if (control) {
-        
-        if (desc->spi_state == STANDARD_SPI_STATE_READY) {
-			//*status = HAL_GetEnableIrq();
+		capi_irq_global_disable();
+
+		if (desc->spi_state == STANDARD_SPI_STATE_READY) {
+			if (backup) {
+				bool enabled;
+				stm32_capi_irq_is_enabled(desc->eth_irq_num, &enabled);
+				*backup = enabled ? 1 : 0;
+			}
 		}
-		HAL_DisableIrq();
-		*(desc->pendingCtrl) = true;
-        
+
+		capi_irq_disable(desc->eth_irq_num);
+		*desc->pending_control = true;
+
+		capi_irq_global_enable();
 
 		if (desc->spi_state != STANDARD_SPI_STATE_READY)
-		{
-			ret = -ETIMEDOUT;
-		}
-		
+			return -ETIMEDOUT;
 	} else {
-		if (desc->spi_state != STANDARD_SPI_STATE_READY) {
-			ret = -EBUSY;
-		}
+		if (desc->spi_state != STANDARD_SPI_STATE_READY)
+			return -EBUSY;
 	}
-	return ret;
+
+	return 0;
 }
 
 static uint8_t crc8_le(uint8_t crc, uint8_t *buf, uint32_t byte_size, uint32_t bits_size, uint8_t poly)
@@ -762,10 +770,13 @@ static uint8_t crc_block8(uint8_t *start_address, uint32_t byte_size, uint32_t b
     }
 }
 
-void standard_spi_callback(void *cb_param, uint32_t event, void *arg)
+void standard_spi_callback(enum capi_async_event event, void *arg,
+			   int event_extra)
 {
-    struct standard_spi_desc *desc = (struct standard_spi_desc *)cb_param;
-    desc->spi_error = event;
+    struct standard_spi_desc *desc = (struct standard_spi_desc *)arg;
+    (void)event_extra;
+
+    desc->spi_error = (event == CAPI_SPI_EVENT_XFR_DONE) ? 0 : 1;
 
     standard_spi_state_machine(desc);
 }
@@ -798,8 +809,8 @@ static int standard_spi_state_machine(struct standard_spi_desc *desc)
 	break;
 	}
 
-	if ((!desc->blocking) || (!desc->pending_control)) {
-		//enable_interrupts();
+	if ((!desc->blocking) || (!(*desc->pending_control))) {
+        capi_irq_enable(desc->eth_irq_num);
 	}
 	desc->spi_state = STANDARD_SPI_STATE_READY;
 	return ret;
