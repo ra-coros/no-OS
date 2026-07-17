@@ -450,7 +450,7 @@ static int spi_fifo_read_start(struct standard_spi_desc *desc)
     }
 
     rx_queue = *desc->rx_queue;
-    frame_entries = (struct eth_frame_struct *)rx_queue->pEntries;
+    frame_entries = (struct eth_frame_struct *)rx_queue->entries;
     byte_count = *(desc->byte_size);
 
     spi_header.CD = (uint16_t)ADI_MAC_SPI_TRANSACTION_CONTROL;
@@ -521,7 +521,7 @@ void spi_fifo_read_end(struct standard_spi_desc *desc)
     if (desc->crc_en)
         byte_offset++;
     
-    frame_entries  = (struct eth_frame_struct *)rx_queue->pEntries;
+    frame_entries  = (struct eth_frame_struct *)rx_queue->entries;
     rx_buf = frame_entries[rx_queue->tail].buf_desc->buf;
     header = *(struct eth_frame_header *)&spi_rx_buf[byte_offset];
     header.VALUE16 = no_os_bswap_constant_16(header.VALUE16);
@@ -684,7 +684,7 @@ static void spi_fifo_write_end(struct standard_spi_desc *desc)
     
     tail = desc->tx_queue->tail;
     net_queue_remove_entry(&*(desc->tx_queue));
-    frame_entries = (struct eth_frame_struct *)desc->tx_queue->pEntries;
+    frame_entries = (struct eth_frame_struct *)desc->tx_queue->entries;
 
     /* Decrement the reference count, and call the callback function only if the reference  */
     /* count is 0. This ensures that if the intent was to send the buffer to both ports, it */
