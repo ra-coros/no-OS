@@ -54,10 +54,10 @@ extern "C" {
 struct net_queue
 {	
 	/*!< Pointer to the entries in the queue */
-    void *pEntries;  
+    void *entries;  
 	
 	/*!< Number of entries that can be held in the queue */  
-    uint32_t numEntries; 
+    uint32_t num_entries; 
 	
 	/*!< Queue head index */
     volatile uint32_t head;  
@@ -89,8 +89,8 @@ struct net_queue_stats_counter
 };
 
 /* Initializes the queue data structure */
-int net_queue_init (struct net_queue *const net_queue_p, void *const pEntries,
-	uint32_t numEntries);
+int net_queue_init (struct net_queue *const net_queue_p, void *const entries,
+	uint32_t num_entries);
 
 /* Gets the current number of frames in the queue */
 uint32_t net_queue_get_count (struct net_queue *const net_queue_p);

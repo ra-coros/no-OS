@@ -60,30 +60,30 @@ static const uint32_t crc32_lut[] = {
 
 uint32_t calculate_fcs(uint8_t *buff, uint32_t byte_size)
 {
-    const uint8_t *fcs_buff = buff;
-    uint32_t crc;
+	const uint8_t *fcs_buff = buff;
+	uint32_t crc;
 
-    crc = ~0U;
-    while (byte_size--)
-       crc = crc32_lut[(crc ^ *fcs_buff++) & 0xFF] ^ (crc >> 8);
-    return crc ^ ~0U;
+	crc = ~0U;
+	while (byte_size--)
+	crc = crc32_lut[(crc ^ *fcs_buff++) & 0xFF] ^ (crc >> 8);
+	return crc ^ ~0U;
 }
 
 uint8_t calculate_parity(uint8_t *buff, uint32_t byte_size, uint8_t parity)
 {
-    uint32_t i;
+	uint32_t i;
 	uint8_t prt = 0;
 
-    for (i = 0; i < byte_size; i++) {
-        parity ^= buff[i];
-    }
+	for (i = 0; i < byte_size; i++) {
+		parity ^= buff[i];
+	}
 
-    // Count the number of 1-bits in the result
-    for (uint32_t i = 0; i < 8; i++) {
-        prt = prt ^ (parity & 0x1);
-        parity >>= 1;
-    }
+	/* Count the number of 1-bits in the result */
+	for (uint32_t i = 0; i < 8; i++) {
+		prt = prt ^ (parity & 0x1);
+		parity >>= 1;
+	}
 
-    return prt & 0x1;
+	return prt & 0x1;
 }
 
