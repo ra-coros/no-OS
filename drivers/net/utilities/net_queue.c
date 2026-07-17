@@ -48,19 +48,19 @@ static inline uint32_t queue_count(struct net_queue *const queue_p)
 {   
 	uint32_t head = queue_p->head;
 	uint32_t tail = queue_p->tail;
-	uint32_t n = head + queue_p->numEntries - tail;
+	uint32_t n = head + queue_p->num_entries - tail;
 
-	return PSEUDO_MODULO(n, queue_p->numEntries);
+	return PSEUDO_MODULO(n, queue_p->num_entries);
 }
 
 static uint32_t queue_available(struct net_queue *const queue_p)
 {  
-	return (queue_p->numEntries - 1) - queue_count(queue_p);
+	return (queue_p->num_entries - 1) - queue_count(queue_p);
 }
 
 static bool queue_full(struct net_queue *const queue_p)
 {   
-	return (queue_p->numEntries - 1) == queue_count(queue_p);
+	return (queue_p->num_entries - 1) == queue_count(queue_p);
 }
 
 static bool queue_empty(struct net_queue *const queue_p)
@@ -73,13 +73,13 @@ static bool queue_empty(struct net_queue *const queue_p)
 static void queue_add(struct net_queue *const queue_p)
 {       
 	uint32_t n = queue_p->head + 1;
-	queue_p->head = PSEUDO_MODULO(n, queue_p->numEntries);
+	queue_p->head = PSEUDO_MODULO(n, queue_p->num_entries);
 }
 
 static void queue_remove(struct net_queue *const queue_p)
 {
 	uint32_t n = queue_p->tail + 1;
-	queue_p->tail = PSEUDO_MODULO(n, queue_p->numEntries);
+	queue_p->tail = PSEUDO_MODULO(n, queue_p->num_entries);
 }
 
 static uint32_t queue_peek_entry(struct net_queue *const queue_p)
@@ -101,21 +101,21 @@ static uint32_t queue_peek_entry(struct net_queue *const queue_p)
  * @brief Initializes the queue data structure.
  *
  * @param [in] queue_p     Pointer to the queue data structure to initialize.
- * @param [in] pEntries    Pointer to the array of entries for the queue.
- * @param [in] numEntries  Number of entries in the queue.
+ * @param [in] entries     Pointer to the array of entries for the queue.
+ * @param [in] num_entries  Number of entries in the queue.
  *
  * @return 0 if initialization is successful.
  *         -EINVAL for invalid parameters.
  */
 int net_queue_init(struct net_queue *const queue_p, 
-	void *const pEntries, uint32_t numEntries)
+	void *const entries, uint32_t num_entries)
 {   
-	if (queue_p == NULL || pEntries == NULL || numEntries == 0)
+	if (queue_p == NULL || entries == NULL || num_entries == 0)
 		return -EINVAL;
     
 	/* This is the _RAW value */
-	queue_p->pEntries = pEntries;
-	queue_p->numEntries = numEntries;
+	queue_p->entries = entries;
+	queue_p->num_entries = num_entries;
 	queue_p->head = 0;
 	queue_p->tail = 0;
 
