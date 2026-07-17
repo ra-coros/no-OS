@@ -645,6 +645,15 @@ int oa_tc6_irq_handler (struct oa_tc6_desc *const desc);
 /* OPEN-Alliance SPI callback function.Called from the SPI interrupt handler */
 void oa_tc6_spi_callback(void *cb_param, uint32_t event, void *arg);
 
+<<<<<<< HEAD
+=======
+/* Wait until the OA SPI state is READY for 50 ms.*/  
+int oa_tc6_wait_spi_ready(struct oa_tc6_desc *const desc);
+
+/* Attempt to acquire the SPI state machine for a new transaction. */
+int oa_tc6_wait_get_status(struct oa_tc6_desc *const desc, uint8_t *back_up, bool is_ctrl);
+
+>>>>>>> 03349f80f2ebf65a205ff7bf35b209f58d2caa65
 /*
  * Transmit all the frames in the OA_BUFF_TX_READY state and receive the
  * available chunks.
