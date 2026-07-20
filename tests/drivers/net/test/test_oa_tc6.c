@@ -1,0 +1,1348 @@
+/***************************************************************************//**
+ *   @file   test_oa_tc6.c
+ *   @brief  Unit tests for OA TC6 driver
+ *   @author Christine Joy Murillo (christinejoy.murillo@analog.com)
+ *******************************************************************************
+ * Copyright 2026(c) Analog Devices, Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of Analog Devices, Inc. nor the names of its
+ *    contributors may be used to endorse or promote products derived from this
+ *    software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ANALOG DEVICES, INC. "AS IS" AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+ * EVENT SHALL ANALOG DEVICES, INC. BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA,
+ * OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+ * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ ******************************************************************************/
+
+/*******************************************************************************
+ * Strategy
+ * --------
+ * The SUT (`oa_tc6.c`) is compiled into this test translation unit via
+ * `#include "oa_tc6.c"` below the mock header list. That exposes every
+ * `static` for direct test invocation without modifying production code.
+ *
+ * `oa_tc6.c` is excluded from Ceedling's :source: list in `project.yml`
+ * so we don't get multiple-definition errors at link time.
+ *
+ * File layout (top -> bottom):
+ *   1. Mock includes  (must precede SUT include so prototypes are mocked)
+ *   2. #include "oa_tc6.c"        <- SUT
+ *   3. Fixtures (init-style + pre-populated-desc style) + setUp/tearDown
+ *   4. oa_tc6_init / oa_tc6_remove tests
+ *   5. Public API tests   (reg_read_async / reg_write_async / process_tx_frame /
+ *                          irq_handler / spi_callback / wait_spi_ready /
+ *                          wait_get_status)
+ *   6. Pure helper tests  (ctrl_cmd_header / ctrl_cmd_read_data /
+ *                          ctrl_cmd_write_data / ctrl_setup /
+ *                          chunk_error_detector / complete_transmission_checker)
+ *   7. Transaction / state-machine tests
+ *   8. Chunk / RX processor tests (many TEST_IGNORE until fixtures exist)
+ *   9. PHY register tests
+ ******************************************************************************/
+
+#include "unity.h"
+
+#include <errno.h>
+#include <string.h>
+#include <stdint.h>
+
+#include "no_os_util.h"        /* real implementation — field_prep, field_get */
+#include "mock_capi_spi.h"     /* auto-mocks capi_spi_transceive, etc. */
+#include "mock_capi_irq.h"     /* auto-mocks capi_irq_enable, capi_irq_disable */
+#include "mock_capi_alloc.h"   /* auto-mocks capi_calloc, capi_free */
+#include "mock_capi_time.h"    /* auto-mocks capi_uptime */
+#include "mock_net_queue.h"    /* auto-mocks net_queue_is_empty, etc. */
+#include "mock_utilities.h"    /* auto-mocks calculate_parity, calculate_fcs */
+
+#include "oa_tc6.c"            /*exposes statics for testing */
+#include "oa_tc6.h"
+
+/******************************************************************************/
+/*                    Test Data and Helpers                                    */
+/******************************************************************************/
+
+/* Fixture set 1: for tests that go through oa_tc6_init(). */
+static struct capi_spi_device test_spi_dev;
+static struct oa_tc6_desc *test_desc;
+static struct oa_tc6_init_param test_param;
+static uint8_t test_dev_mem[sizeof(struct oa_tc6_desc)] __attribute__((aligned(4)));
+
+/* Fixture set 2: for tests that pre-populate a descriptor directly */
+static struct capi_spi_device g_spi_dev;
+static struct oa_tc6_desc g_desc;
+static struct oa_tc6_init_param g_param;
+static uint8_t g_dev_mem[sizeof(struct oa_tc6_desc)] __attribute__((aligned(4)));
+static struct net_queue g_rx_queue_storage;
+static struct net_queue *g_rx_queue_ptr = &g_rx_queue_storage;
+static struct net_queue g_tx_queue_storage;
+static volatile bool g_pending_ctrl;
+static struct eth_status_registers g_status_regs;
+static uint32_t g_irq_mask0;
+static uint32_t g_irq_mask1;
+static uint32_t g_phy_irq_mask;
+static uint32_t g_reg_data;
+
+/* RX/TX frame fixture: one entry each */
+#define G_FRAME_BUF_SIZE 128
+static uint8_t g_rx_frame_buf[G_FRAME_BUF_SIZE];
+static uint8_t g_tx_frame_buf[G_FRAME_BUF_SIZE];
+static struct eth_buf_desc g_rx_buf_desc;
+static struct eth_buf_desc g_tx_buf_desc;
+static struct eth_frame_struct g_rx_entries[1];
+static struct eth_frame_struct g_tx_entries[1];
+static eth_callback_t g_cb_funcs[MAC_EVT_MAX];
+
+/* Test-scope callback capture counters (used by test_cb_function_caller_*). */
+/* These are callbacks set by the application layer */
+static uint32_t g_cb_dyn_calls;
+static uint32_t g_cb_buf_calls;
+static void g_cb_dyn_tbl_stub(void *cd_param, uint32_t event, void *arg)
+{
+	(void)cd_param; (void)event; (void)arg;
+	g_cb_dyn_calls++;
+}
+static void g_cb_buf_stub(void *cd_param, uint32_t event, void *arg)
+{
+	(void)cd_param; (void)event; (void)arg;
+	g_cb_buf_calls++;
+}
+
+static void init_default_param(void)
+{
+	memset(&test_spi_dev, 0, sizeof(test_spi_dev));
+	memset(&test_dev_mem, 0, sizeof(test_dev_mem));
+	memset(&test_param, 0, sizeof(test_param));
+
+	test_param.comm_desc = &test_spi_dev;
+	test_param.p_dev_mem = test_dev_mem;
+	test_param.dev_mem_size = sizeof(test_dev_mem);
+	test_param.prote_spi = false;
+	test_param.rx_queue_hp_en = false;
+	test_param.fcs_check_en = true;
+	test_param.num_ports = 1;
+
+	test_desc = NULL;
+}
+
+/* Reset the "direct-desc" fixture to a known-good, ready-to-drive state. */
+static void reset_fixtures(void)
+{
+	memset(&g_spi_dev, 0, sizeof(g_spi_dev));
+	memset(&g_desc,    0, sizeof(g_desc));
+	memset(&g_param,   0, sizeof(g_param));
+	memset(g_dev_mem,  0, sizeof(g_dev_mem));
+	memset(&g_rx_queue_storage, 0, sizeof(g_rx_queue_storage));
+	memset(&g_tx_queue_storage, 0, sizeof(g_tx_queue_storage));
+	memset(&g_status_regs, 0, sizeof(g_status_regs));
+	memset(g_rx_frame_buf, 0, sizeof(g_rx_frame_buf));
+	memset(g_tx_frame_buf, 0, sizeof(g_tx_frame_buf));
+	memset(&g_rx_buf_desc, 0, sizeof(g_rx_buf_desc));
+	memset(&g_tx_buf_desc, 0, sizeof(g_tx_buf_desc));
+	memset(g_rx_entries, 0, sizeof(g_rx_entries));
+	memset(g_tx_entries, 0, sizeof(g_tx_entries));
+	memset(g_cb_funcs, 0, sizeof(g_cb_funcs));
+	g_cb_dyn_calls = 0;
+	g_cb_buf_calls = 0;
+	g_irq_mask0 = 0;
+	g_irq_mask1 = 0;
+	g_phy_irq_mask = 0;
+	g_reg_data = 0;
+	g_pending_ctrl = false;
+
+	g_rx_buf_desc.buf         = g_rx_frame_buf;
+	g_rx_buf_desc.buf_size    = G_FRAME_BUF_SIZE;
+	g_tx_buf_desc.buf         = g_tx_frame_buf;
+	g_tx_buf_desc.buf_size    = G_FRAME_BUF_SIZE;
+	g_rx_entries[0].buf_desc  = &g_rx_buf_desc;
+	g_tx_entries[0].buf_desc  = &g_tx_buf_desc;
+	g_rx_queue_storage.entries     = g_rx_entries;
+	g_rx_queue_storage.num_entries = 1;
+	g_tx_queue_storage.entries     = g_tx_entries;
+	g_tx_queue_storage.num_entries = 1;
+
+	g_desc.comm_desc     = &g_spi_dev;
+	g_desc.spi_state     = OA_SPI_STATE_READY;
+	g_desc.spi_err       = 0;
+	g_desc.oa_cps        = OA_DEFAULT_CPS;
+	g_desc.oa_txc        = 31;
+	g_desc.oa_rca        = 0;
+	g_desc.num_ports     = 1;
+	g_desc.fcs_check_en  = true;
+	g_desc.prote_spi     = false;
+	g_desc.tx_queue      = &g_tx_queue_storage;
+	g_desc.rx_queue      = &g_rx_queue_ptr;
+	g_desc.pending_ctrl  = &g_pending_ctrl;
+	g_desc.eth_irq       = 15;
+	g_desc.oa_max_chunk_count = OA_MAX_CHUNK64_COUNT;
+	g_desc.status_regs   = &g_status_regs;
+	g_desc.irq_mask0     = &g_irq_mask0;
+	g_desc.irq_mask1     = &g_irq_mask1;
+	g_desc.phy_irq_mask  = &g_phy_irq_mask;
+	g_desc.reg_data      = &g_reg_data;
+	g_desc.cb_func       = g_cb_funcs;
+}
+
+/******************************************************************************/
+/*                          setUp / tearDown                                   */
+/******************************************************************************/
+
+void setUp(void)
+{
+	init_default_param();
+	reset_fixtures();
+}
+
+void tearDown(void)
+{
+	test_desc = NULL;
+}
+
+/******************************************************************************/
+/*                      oa_tc6_init test cases                                 */
+/******************************************************************************/
+
+void test_oa_tc6_init_null_desc_returns_einval(void)
+{
+	int ret = oa_tc6_init(NULL, &test_param);
+
+	TEST_ASSERT_EQUAL_INT(-EINVAL, ret);
+}
+
+void test_oa_tc6_init_null_param_returns_einval(void)
+{
+	int ret = oa_tc6_init(&test_desc, NULL);
+
+	TEST_ASSERT_EQUAL_INT(-EINVAL, ret);
+}
+
+void test_oa_tc6_init_dev_mem_too_small_returns_enomem(void)
+{
+	test_param.dev_mem_size = 4;
+
+	int ret = oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_INT(-ENOMEM, ret);
+}
+
+void test_oa_tc6_init_success_sets_desc_pointer(void)
+{
+	int ret = oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_NOT_NULL(test_desc);
+	TEST_ASSERT_EQUAL_PTR(test_dev_mem, test_desc);
+}
+
+void test_oa_tc6_init_success_sets_comm_desc(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_PTR(&test_spi_dev, test_desc->comm_desc);
+}
+
+void test_oa_tc6_init_success_sets_prote_spi(void)
+{
+	test_param.prote_spi = true;
+
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_TRUE(test_desc->prote_spi);
+}
+
+void test_oa_tc6_init_success_sets_num_ports(void)
+{
+	test_param.num_ports = 2;
+
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT8(2, test_desc->num_ports);
+}
+
+/* Full-state init check for the num_ports=2 configuration.
+ * Verifies that flipping num_ports to 2 does not perturb the rest of the
+ * ready-state contract (spi_state, cps/txc/rca defaults, valid_flag, stats). */
+void test_oa_tc6_init_num_ports_2_full_ready_state(void)
+{
+	test_param.num_ports = 2;
+
+	int ret = oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_NOT_NULL(test_desc);
+	TEST_ASSERT_EQUAL_UINT8(2, test_desc->num_ports);
+	TEST_ASSERT_EQUAL_PTR(&test_spi_dev, test_desc->comm_desc);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_READY, test_desc->spi_state);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->spi_err);
+	TEST_ASSERT_EQUAL_UINT32(OA_DEFAULT_CPS, test_desc->oa_cps);
+	TEST_ASSERT_EQUAL_UINT32(OA_MAX_CHUNK64_COUNT, test_desc->oa_max_chunk_count);
+	TEST_ASSERT_EQUAL_UINT32(31, test_desc->oa_txc);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->oa_rca);
+	TEST_ASSERT_EQUAL_UINT(OA_VALID_FLAG_NONE, test_desc->oa_valid_flag);
+	TEST_ASSERT_EQUAL_UINT(OA_TS_FORMAT_NONE, test_desc->ts_format);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.fd_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.invalid_sv_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.invalid_ev_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.ftr_parity_error_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.hdr_parity_error_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.sync_error_count);
+}
+
+void test_oa_tc6_init_success_sets_fcs_check_en(void)
+{
+	test_param.fcs_check_en = true;
+
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_TRUE(test_desc->fcs_check_en);
+}
+
+void test_oa_tc6_init_success_sets_rx_queue_hp_en(void)
+{
+	test_param.rx_queue_hp_en = true;
+
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_TRUE(test_desc->rx_queue_hp_en);
+}
+
+void test_oa_tc6_init_success_state_is_ready(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_READY, test_desc->spi_state);
+}
+
+void test_oa_tc6_init_success_spi_err_is_zero(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->spi_err);
+}
+
+void test_oa_tc6_init_success_txc_initialized_to_31(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT32(31, test_desc->oa_txc);
+}
+
+void test_oa_tc6_init_success_rca_initialized_to_zero(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->oa_rca);
+}
+
+void test_oa_tc6_init_success_cps_set_to_default(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT32(OA_DEFAULT_CPS, test_desc->oa_cps);
+}
+
+void test_oa_tc6_init_success_max_chunk_count_set(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT32(OA_MAX_CHUNK64_COUNT, test_desc->oa_max_chunk_count);
+}
+
+void test_oa_tc6_init_success_valid_flag_is_none(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT(OA_VALID_FLAG_NONE, test_desc->oa_valid_flag);
+}
+
+void test_oa_tc6_init_success_error_stats_zeroed(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.fd_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.invalid_sv_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.invalid_ev_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.ftr_parity_error_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.hdr_parity_error_count);
+	TEST_ASSERT_EQUAL_UINT32(0, test_desc->error_stats.sync_error_count);
+}
+
+void test_oa_tc6_init_success_buffers_zeroed(void)
+{
+	uint8_t zero_buf[OA_CTRL_BUF_SIZE] = {0};
+
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT8_ARRAY(zero_buf, test_desc->ctrl_tx_buf, OA_CTRL_BUF_SIZE);
+	TEST_ASSERT_EQUAL_UINT8_ARRAY(zero_buf, test_desc->ctrl_rx_buf, OA_CTRL_BUF_SIZE);
+}
+
+void test_oa_tc6_init_success_timestamp_format_none(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	TEST_ASSERT_EQUAL_UINT(OA_TS_FORMAT_NONE, test_desc->ts_format);
+}
+
+/******************************************************************************/
+/*                      oa_tc6_remove test cases                               */
+/******************************************************************************/
+
+void test_oa_tc6_remove_null_returns_enodev(void)
+{
+	int ret = oa_tc6_remove(NULL);
+
+	TEST_ASSERT_EQUAL_INT(-ENODEV, ret);
+}
+
+void test_oa_tc6_remove_success_returns_zero(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+
+	int ret = oa_tc6_remove(test_desc);
+
+	TEST_ASSERT_EQUAL_INT(0, ret);
+}
+
+void test_oa_tc6_remove_zeroes_descriptor(void)
+{
+	uint8_t zero_buf[sizeof(struct oa_tc6_desc)] = {0};
+
+	oa_tc6_init(&test_desc, &test_param);
+	oa_tc6_remove(test_desc);
+
+	TEST_ASSERT_EQUAL_UINT8_ARRAY(zero_buf, (uint8_t *)test_desc, sizeof(struct oa_tc6_desc));
+}
+
+void test_oa_tc6_remove_clears_comm_desc(void)
+{
+	oa_tc6_init(&test_desc, &test_param);
+	oa_tc6_remove(test_desc);
+
+	TEST_ASSERT_NULL(test_desc->comm_desc);
+}
+
+void test_oa_tc6_remove_after_init_full_cycle(void)
+{
+	int ret;
+
+	ret = oa_tc6_init(&test_desc, &test_param);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_NOT_NULL(test_desc);
+
+	ret = oa_tc6_remove(test_desc);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+}
+
+/*==============================================================================
+ * PUBLIC API tests
+ *============================================================================*/
+
+/* ------ oa_tc6_reg_read_async -------------------------------------------------
+ * Contract:
+ *   - NULL desc -> -ENODEV
+ *   - Populates desc->{wnr,reg_addr,reg_data,cnt} then transitions to
+ *     OA_SPI_STATE_CTRL_START and enters the state machine which fires
+ *     capi_spi_transceive_async(). */
+void test_reg_read_async_null_desc_returns_enodev(void)
+{
+	uint32_t data = 0;
+	TEST_ASSERT_EQUAL_INT(-ENODEV, oa_tc6_reg_read_async(NULL, 0x08, &data, 1));
+}
+
+void test_reg_read_async_sets_wnr_read_and_fields(void)
+{
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	calculate_parity_IgnoreAndReturn(1);
+	uint32_t val = 0;
+	int ret = oa_tc6_reg_read_async(&g_desc, 0x1234, &val, 2);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT32(OA_SPI_READ, g_desc.wnr);
+	TEST_ASSERT_EQUAL_UINT32(0x1234, g_desc.reg_addr);
+	TEST_ASSERT_EQUAL_PTR  (&val, g_desc.reg_data);
+	TEST_ASSERT_EQUAL_UINT32(2, g_desc.cnt);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_CTRL_END, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_reg_write_async ------------------------------------------------
+ * Same shape as read_async but sets wnr=OA_SPI_WRITE. */
+void test_reg_write_async_null_desc_returns_enodev(void)
+{
+	uint32_t val = 0xDEABCAFE;
+	TEST_ASSERT_EQUAL_INT(-ENODEV, oa_tc6_reg_write_async(NULL, 0x08, &val, 1));
+}
+
+void test_reg_write_async_sets_wnr_write(void)
+{
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	calculate_parity_IgnoreAndReturn(1);
+	uint32_t val = 0xAABBCCDD;
+	int ret = oa_tc6_reg_write_async(&g_desc, 0x0004, &val, 1);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT32(OA_SPI_WRITE, g_desc.wnr);
+	TEST_ASSERT_EQUAL_UINT32(0x0004,       g_desc.reg_addr);
+}
+
+/* ------ oa_tc6_process_tx_frame ----------------------------------------------
+ * Stores `blocking`, sets state to DATA_START, calls state machine. */
+void test_process_tx_frame_stores_blocking_flag(void)
+{
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	capi_irq_enable_IgnoreAndReturn(0);
+	capi_irq_disable_IgnoreAndReturn(0);
+	calculate_parity_IgnoreAndReturn(1);
+	net_queue_is_empty_IgnoreAndReturn(true);
+	net_queue_is_full_IgnoreAndReturn(false);
+
+	g_desc.oa_rca = 1;
+	int ret = oa_tc6_process_tx_frame(&g_desc, true);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_TRUE(g_desc.blocking);
+        TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_DATA_END, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_irq_handler ----------------------------------------------------
+ * Contract:
+ *   - NULL desc -> -EINVAL
+ *   - If state != READY, no-op.
+ *   - If state == READY, disable IRQ, move to IRQ_START, run state machine. */
+void test_irq_handler_null_desc_returns_einval(void)
+{
+	TEST_ASSERT_EQUAL_INT(-EINVAL, oa_tc6_irq_handler(NULL));
+}
+
+void test_irq_handler_busy_state(void)
+{
+	g_desc.spi_state = OA_SPI_STATE_CTRL_END;
+	int ret = oa_tc6_irq_handler(&g_desc);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_CTRL_END, g_desc.spi_state);
+}
+
+void test_irq_handler_ready_state_starts_irq(void)
+{
+	capi_irq_disable_IgnoreAndReturn(0);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	calculate_parity_IgnoreAndReturn(1);
+
+	int ret = oa_tc6_irq_handler(&g_desc);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_DATA_END, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_spi_callback ---------------------------------------------------
+ * Casts cb_param to (struct oa_tc6_desc *) and re-runs state machine. */
+void test_spi_callback_runs_state_machine(void)
+{
+	g_desc.spi_state = OA_SPI_STATE_READY;
+	capi_irq_enable_IgnoreAndReturn(0);
+	oa_tc6_spi_callback(&g_desc, 0, NULL);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_READY, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_wait_spi_ready ------------------------------------------------
+ * State already READY -> returns 0 immediately.
+ * Else polls capi_uptime until timeout -> -ETIMEDOUT. */
+void test_wait_spi_ready_already_ready(void)
+{
+	g_desc.spi_state = OA_SPI_STATE_READY;
+	TEST_ASSERT_EQUAL_INT(0, oa_tc6_wait_spi_ready(&g_desc));
+}
+
+void test_wait_spi_ready_times_out(void)
+{
+	g_desc.spi_state = OA_SPI_STATE_CTRL_END;
+	capi_uptime_ExpectAnyArgsAndReturn(0);
+	capi_uptime_ReturnThruPtr_us(&(uint64_t){0});
+	capi_uptime_ExpectAnyArgsAndReturn(0);
+	capi_uptime_ReturnThruPtr_us(&(uint64_t){SPI_COMMS_TIMEOUT_US + 1});
+
+	TEST_ASSERT_EQUAL_INT(-ETIMEDOUT, oa_tc6_wait_spi_ready(&g_desc));
+}
+
+/* ------ oa_tc6_wait_get_status -----------------------------------------------
+ * NULL desc -> -EINVAL
+ * is_ctrl=false: state != READY -> -EBUSY, else 0. */
+void test_wait_get_status_null_desc_returns_einval(void)
+{
+	uint8_t backup = 0;
+	TEST_ASSERT_EQUAL_INT(-EINVAL, oa_tc6_wait_get_status(NULL, &backup, false));
+}
+
+void test_wait_get_status_non_ctrl_ready_returns_zero(void)
+{
+	uint8_t backup = 0;
+	g_desc.spi_state = OA_SPI_STATE_READY;
+	TEST_ASSERT_EQUAL_INT(0, oa_tc6_wait_get_status(&g_desc, &backup, false));
+}
+
+void test_wait_get_status_non_ctrl_busy_returns_ebusy(void)
+{
+	uint8_t backup = 0;
+	g_desc.spi_state = OA_SPI_STATE_CTRL_END;
+	TEST_ASSERT_EQUAL_INT(-EBUSY, oa_tc6_wait_get_status(&g_desc, &backup, false));
+}
+
+/* ------ oa_tc6_ctrl_cmd_header -----------------------------------------------
+ * Packs 4-byte BE header:
+ *   DNC(31) | HDRB(30) | WNR(29) | AID(28) | MMS(27:24) |
+ *   ADDR(23:8) | LEN(7:1) | P(0)
+ * MMS derived from addr: 0 if addr < 0x30, else 1. LEN = cnt-1. */
+void test_ctrl_cmd_header_read_mms0_addr8(void)
+{
+	calculate_parity_ExpectAnyArgsAndReturn(1);
+	uint8_t buf[4] = {0};
+        uint32_t addr = 0x08;
+	oa_tc6_ctrl_cmd_header(buf, OA_SPI_READ, addr, 2);
+
+	uint32_t val = no_os_get_unaligned_be32(buf);
+	TEST_ASSERT_EQUAL_UINT32(0x00, no_os_field_get(OA_CTRL_HEADER_DNC_MASK, val));
+	TEST_ASSERT_EQUAL_UINT32(0x00, no_os_field_get(OA_CTRL_HEADER_HDRB_MASK, val));
+        TEST_ASSERT_EQUAL_UINT32(OA_SPI_READ, no_os_field_get(OA_CTRL_HEADER_WNR_MASK, val));
+        TEST_ASSERT_EQUAL_UINT32(0x00, no_os_field_get(OA_CTRL_HEADER_AID_MASK, val));
+        TEST_ASSERT_EQUAL_UINT32(0x00, no_os_field_get(OA_CTRL_HEADER_HDRB_MASK, val));
+	TEST_ASSERT_EQUAL_UINT32(0x00, no_os_field_get(OA_CTRL_HEADER_MMS_MASK, val));
+	TEST_ASSERT_EQUAL_UINT32(0x08, no_os_field_get(OA_CTRL_HEADER_ADDR_MASK, val));
+	TEST_ASSERT_EQUAL_UINT32(1, no_os_field_get(OA_CTRL_HEADER_LEN_MASK,  val));
+        TEST_ASSERT_EQUAL_UINT32(1, no_os_field_get(OA_CTRL_HEADER_P_MASK, val));
+}
+
+void test_ctrl_cmd_header_write_mms1_when_addr_ge_0x30(void)
+{
+	calculate_parity_ExpectAnyArgsAndReturn(1);
+	uint8_t buf[4] = {0};
+	oa_tc6_ctrl_cmd_header(buf, OA_SPI_WRITE, 0x40, 2);
+
+	uint32_t val = no_os_get_unaligned_be32(buf);
+	TEST_ASSERT_EQUAL_UINT32(0x00, no_os_field_get(OA_CTRL_HEADER_DNC_MASK, val));
+	TEST_ASSERT_EQUAL_UINT32(0x00, no_os_field_get(OA_CTRL_HEADER_HDRB_MASK, val));
+        TEST_ASSERT_EQUAL_UINT32(OA_SPI_WRITE, no_os_field_get(OA_CTRL_HEADER_WNR_MASK, val));
+        TEST_ASSERT_EQUAL_UINT32(0x00, no_os_field_get(OA_CTRL_HEADER_AID_MASK, val));
+        TEST_ASSERT_EQUAL_UINT32(0x00, no_os_field_get(OA_CTRL_HEADER_HDRB_MASK, val));
+	TEST_ASSERT_EQUAL_UINT32(1, no_os_field_get(OA_CTRL_HEADER_MMS_MASK, val));
+	TEST_ASSERT_EQUAL_UINT32(0x40, no_os_field_get(OA_CTRL_HEADER_ADDR_MASK, val));
+	TEST_ASSERT_EQUAL_UINT32(1, no_os_field_get(OA_CTRL_HEADER_LEN_MASK,  val));
+        TEST_ASSERT_EQUAL_UINT32(1, no_os_field_get(OA_CTRL_HEADER_P_MASK, val));
+}
+
+/* ------ oa_tc6_ctrl_cmd_write_data -------------------------------------------
+ * Unprotected: N regs -> N * 4 BE bytes.
+ * Protected: for each reg, packs value THEN its bitwise complement. */
+void test_ctrl_cmd_write_data_unprotected(void)
+{
+	uint8_t dst[8] = {0};
+	uint32_t src[2] = { 0x11223344, 0xAABBCCDD };
+	oa_tc6_ctrl_cmd_write_data(dst, src, 2, false);
+	TEST_ASSERT_EQUAL_HEX32(0x11223344, no_os_get_unaligned_be32(&dst[0]));
+	TEST_ASSERT_EQUAL_HEX32(0xAABBCCDD, no_os_get_unaligned_be32(&dst[4]));
+}
+
+void test_ctrl_cmd_write_data_protected_adds_complement(void)
+{
+	uint8_t dst[16] = {0};
+	uint32_t src[2] = { 0x11223344, 0xAABBCCDD };
+	oa_tc6_ctrl_cmd_write_data(dst, src, 2, true);
+	TEST_ASSERT_EQUAL_HEX32(0x11223344, no_os_get_unaligned_be32(&dst[0]));
+	TEST_ASSERT_EQUAL_HEX32(~0x11223344u, no_os_get_unaligned_be32(&dst[4]));
+	TEST_ASSERT_EQUAL_HEX32(0xAABBCCDD, no_os_get_unaligned_be32(&dst[8]));
+	TEST_ASSERT_EQUAL_HEX32(~0xAABBCCDDu, no_os_get_unaligned_be32(&dst[12]));
+}
+
+/* ------ oa_tc6_ctrl_cmd_read_data --------------------------------------------
+ * Unprotected: reads N 4-byte BE words from src.
+ * Protected: reads value + complement, -EPROTO on mismatch. */
+void test_ctrl_cmd_read_data_unprotected(void)
+{
+	uint32_t dst[2] = {0};
+	uint8_t  src[8] = {0};
+	no_os_put_unaligned_be32(0x11223344, &src[0]);
+	no_os_put_unaligned_be32(0x55667788, &src[4]);
+	TEST_ASSERT_EQUAL_INT(0, oa_tc6_ctrl_cmd_read_data(dst, src, 2, false));
+	TEST_ASSERT_EQUAL_HEX32(0x11223344, dst[0]);
+	TEST_ASSERT_EQUAL_HEX32(0x55667788, dst[1]);
+}
+
+void test_ctrl_cmd_read_data_protected_matches_complement(void)
+{
+	uint32_t dst[1] = {0};
+	uint8_t  src[8] = {0};
+	no_os_put_unaligned_be32(0x11223344,  &src[0]);
+	no_os_put_unaligned_be32(~0x11223344u, &src[4]);
+	TEST_ASSERT_EQUAL_INT(0, oa_tc6_ctrl_cmd_read_data(dst, src, 1, true));
+	TEST_ASSERT_EQUAL_HEX32(0x11223344, dst[0]);
+}
+
+void test_ctrl_cmd_read_data_protected_mismatch_returns_eproto(void)
+{
+	uint32_t dst[1] = {0};
+	uint8_t  src[8] = {0};
+	no_os_put_unaligned_be32(0x11223344, &src[0]);
+	no_os_put_unaligned_be32(0xABCDEFAA, &src[4]);
+	TEST_ASSERT_EQUAL_INT(-EPROTO, oa_tc6_ctrl_cmd_read_data(dst, src, 1, true));
+}
+
+/* ------ oa_tc6_ctrl_setup ----------------------------------------------------
+ * Builds header at buf[0..3], (optionally) write payload from buf[4..],
+ * updates *len from word count to byte count.
+ * -EINVAL if requested size > OA_CTRL_BUF_SIZE - 2. */
+void test_ctrl_setup_read_no_prote_computes_len_in_bytes(void)
+{
+	uint8_t buf[64] = {0};
+	uint32_t len = 1;
+	calculate_parity_ExpectAnyArgsAndReturn(0);
+	int ret = oa_tc6_ctrl_setup(buf, OA_SPI_READ, 0x08, NULL, &len, false);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT32(12, len);
+}
+
+void test_ctrl_setup_write_prote_doubles_payload_size(void)
+{
+	uint8_t buf[64] = {0};
+	uint32_t data = 0xAABBCCDD;
+	uint32_t len = 1;
+	calculate_parity_ExpectAnyArgsAndReturn(0);
+	int ret = oa_tc6_ctrl_setup(buf, OA_SPI_WRITE, 0x08, &data, &len, true);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT32(16, len);
+}
+
+void test_ctrl_setup_too_large_returns_einval(void)
+{
+	uint8_t buf[OA_CTRL_BUF_SIZE] = {0};
+	uint32_t len = OA_CTRL_BUF_SIZE;
+	int ret = oa_tc6_ctrl_setup(buf, OA_SPI_READ, 0x08, NULL, &len, false);
+	TEST_ASSERT_EQUAL_INT(-EINVAL, ret);
+}
+
+/* ------ oa_tc6_chunk_error_detector ------------------------------------------
+ * Footer == OA_HEADER_BAD -> hdr_parity_error_count++, returns true.
+ * Otherwise checks footer parity and SYNC bit. */
+void test_chunk_error_detector_bad_header_pattern(void)
+{
+	TEST_ASSERT_TRUE(oa_tc6_chunk_error_detector(&g_desc, OA_HEADER_BAD));
+	TEST_ASSERT_EQUAL_UINT32(1, g_desc.error_stats.hdr_parity_error_count);
+}
+
+void test_chunk_error_detector_parity_fail(void)
+{
+	calculate_parity_ExpectAnyArgsAndReturn(0);
+	TEST_ASSERT_TRUE(oa_tc6_chunk_error_detector(&g_desc, 0x00000000));
+	TEST_ASSERT_EQUAL_UINT32(1, g_desc.error_stats.ftr_parity_error_count);
+	TEST_ASSERT_EQUAL_UINT32(1, g_desc.error_stats.sync_error_count);
+}
+
+void test_chunk_error_detector_valid_footer(void)
+{
+	calculate_parity_ExpectAnyArgsAndReturn(1);
+	uint32_t footer = OA_DATA_FOOTER_SYNC_MASK;
+	TEST_ASSERT_FALSE(oa_tc6_chunk_error_detector(&g_desc, footer));
+	TEST_ASSERT_EQUAL_UINT32(0, g_desc.error_stats.ftr_parity_error_count);
+	TEST_ASSERT_EQUAL_UINT32(0, g_desc.error_stats.sync_error_count);
+}
+
+/* ------ oa_tc6_complete_transmission_checker ---------------------------------
+ * EV=0 -> no-op. EV=1 requires eth_frame_struct fixture. */
+void test_complete_transmission_checker_ev_zero_is_noop(void)
+{
+	uint32_t event = 0;
+	oa_tc6_complete_transmission_checker(&g_desc, 0, &event);
+	TEST_ASSERT_EQUAL_UINT32(0, event);
+}
+
+/*==============================================================================
+ * TRANSACTION / STATE MACHINE tests
+ *============================================================================*/
+
+void test_state_machine_default_case_sets_spi_err_and_recovers(void)
+{
+	g_desc.spi_state = (enum oa_tc6_spi_state)0xFF;
+	capi_irq_enable_IgnoreAndReturn(0);
+	int ret = oa_tc6_state_machine(&g_desc);
+	TEST_ASSERT_EQUAL_INT(-EPROTO, ret);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_READY, g_desc.spi_state);
+	TEST_ASSERT_EQUAL_UINT32(1, g_desc.spi_err);
+}
+
+void test_state_machine_ctrl_start_dispatches_start_ctrl(void)
+{
+	g_desc.spi_state = OA_SPI_STATE_CTRL_START;
+	g_desc.wnr = OA_SPI_READ;
+	g_desc.cnt = 1;
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	calculate_parity_IgnoreAndReturn(1);
+
+	int ret = oa_tc6_state_machine(&g_desc);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_CTRL_END, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_start_ctrl_transaction ----------------------------------------
+ * Builds ctrl_tx_buf via ctrl_setup, transitions to CTRL_END, fires SPI. */
+void test_start_ctrl_transaction_transitions_to_ctrl_end(void)
+{
+	g_desc.wnr = OA_SPI_READ;
+	g_desc.cnt = 1;
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_async_ExpectAnyArgsAndReturn(0);
+
+	int ret = oa_tc6_start_ctrl_transaction(&g_desc);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_CTRL_END, g_desc.spi_state);
+}
+
+void test_start_ctrl_transaction_propagates_spi_error(void)
+{
+	g_desc.wnr = OA_SPI_READ;
+	g_desc.cnt = 1;
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_async_ExpectAnyArgsAndReturn(-EIO);
+
+	int ret = oa_tc6_start_ctrl_transaction(&g_desc);
+	TEST_ASSERT_EQUAL_INT(-EIO, ret);
+}
+
+/* ------ oa_tc6_end_ctrl_transaction ------------------------------------------
+ * Layout: cHdr = ctrl_tx_buf[0..3] must equal eHdr = ctrl_rx_buf[4..7],
+ * register value read from ctrl_rx_buf[8..11] (2 * OA_HEADER_SIZE). */
+void test_end_ctrl_transaction_transitions_to_ready_after_read(void)
+{
+	uint32_t val = 0;
+	g_desc.wnr = OA_SPI_READ;
+	g_desc.cnt = 1;
+	g_desc.reg_data = &val;
+	g_desc.prote_spi = false;
+	*(uint32_t *)&g_desc.ctrl_tx_buf[0] = 0xAABBCCDD;
+	*(uint32_t *)&g_desc.ctrl_rx_buf[OA_HEADER_SIZE] = 0xAABBCCDD;
+	no_os_put_unaligned_be32(0xC0FFEE00, &g_desc.ctrl_rx_buf[2 * OA_HEADER_SIZE]);
+	capi_irq_enable_IgnoreAndReturn(0);
+
+	oa_tc6_end_ctrl_transaction(&g_desc);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_READY, g_desc.spi_state);
+	TEST_ASSERT_EQUAL_HEX32(0xC0FFEE00, val);
+}
+
+void test_end_ctrl_transaction_bad_header(void)
+{
+	uint32_t val = 0;
+	g_desc.wnr = OA_SPI_READ;
+	g_desc.cnt = 1;
+	g_desc.reg_data = &val;
+	g_desc.prote_spi = false;
+	*(uint32_t *)&g_desc.ctrl_tx_buf[0] = 0xAABBCCDD;
+	*(uint32_t *)&g_desc.ctrl_rx_buf[OA_HEADER_SIZE] = 0xDDAABBCC;
+	no_os_put_unaligned_be32(0xC0FFEE00, &g_desc.ctrl_rx_buf[2 * OA_HEADER_SIZE]);
+	capi_irq_enable_IgnoreAndReturn(0);
+
+	oa_tc6_end_ctrl_transaction(&g_desc);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_READY, g_desc.spi_state);
+        TEST_ASSERT_EQUAL_UINT(1, g_desc.spi_err);
+}
+
+/* ------ oa_tc6_start_data_transaction ----------------------------------------
+ * Builds batch, transitions to DATA_END, fires SPI.
+ * Set oa_rca=1 to force at least one chunk to be built. */
+void test_start_data_transaction_transitions_to_data_end(void)
+{
+	net_queue_is_empty_IgnoreAndReturn(true);
+	net_queue_is_full_IgnoreAndReturn(false);
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	capi_irq_enable_IgnoreAndReturn(0);
+	g_desc.oa_rca = 1;
+	g_desc.blocking = true;
+	oa_tc6_start_data_transaction(&g_desc);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_DATA_END, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_start_data_transaction (no chunks path) ----------------------
+ * With oa_rca=0 and tx_queue empty, spi_process returns ret=0 and leaves
+ * oa_trx_size=0. This forces the else branch: spi_state -> READY, and since
+ * pending_ctrl is false, capi_irq_enable is called with desc->eth_irq. */
+void test_start_data_transaction_invalid_trx_size(void)
+{
+	net_queue_is_empty_IgnoreAndReturn(true);
+	net_queue_is_full_IgnoreAndReturn(false);
+	g_desc.oa_rca = 0;
+	g_desc.blocking = true;
+	g_pending_ctrl = false;
+
+	capi_irq_enable_ExpectAndReturn(g_desc.eth_irq, 0);
+
+	oa_tc6_start_data_transaction(&g_desc);
+
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_READY, g_desc.spi_state);
+	TEST_ASSERT_EQUAL_UINT32(0, g_desc.oa_trx_size);
+}
+
+/* ------ oa_tc6_start_irq -----------------------------------------------------
+ * Builds single-chunk IRQ header (DNC=1, NORX=1), dispatches SPI, DATA_END. */
+void test_start_irq_moves_state_to_data_end(void)
+{
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	int ret = oa_tc6_start_irq(&g_desc);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_DATA_END, g_desc.spi_state);
+	TEST_ASSERT_EQUAL_UINT32(OA_HEADER_SIZE + (1u << OA_DEFAULT_CPS),
+	                         g_desc.oa_trx_size);
+}
+
+void test_start_irq_propagates_spi_error(void)
+{
+	calculate_parity_IgnoreAndReturn(1);
+	g_desc.blocking = false;
+	capi_spi_transceive_dma_async_ExpectAnyArgsAndReturn(-EIO);
+	int ret = oa_tc6_start_irq(&g_desc);
+	TEST_ASSERT_EQUAL_INT(-EIO, ret);
+}
+
+/*==============================================================================
+ * CHUNK / RX PROCESSOR tests
+ *   Most require eth_frame_struct scaffolding; kept as TEST_IGNORE placeholders.
+ *============================================================================*/
+
+/* ------ oa_tc6_fcs_checker ---------------------------------------------------
+ * fcs_size <= FCS_SIZE forces the "else" branch that flags MAC_CALLBACK_STATUS_FCS_ERROR
+ * and zeroes rx_buf[trx_size]. */
+void test_fcs_checker_size_le_fcs_size_flags_error(void)
+{
+	uint32_t event = 0;
+	g_rx_buf_desc.trx_size = 0;
+	g_rx_frame_buf[0] = 0xAB;
+	oa_tc6_fcs_checker(&g_desc, 2, g_rx_frame_buf, &event);
+	TEST_ASSERT_TRUE(event & MAC_CALLBACK_STATUS_FCS_ERROR);
+	TEST_ASSERT_EQUAL_HEX8(0, g_rx_frame_buf[0]);
+}
+
+/* ------ oa_tc6_timestamp_handler ---------------------------------------------
+ * Default (unknown enum) returns early without touching frame_dest / byte_offset. */
+void test_timestamp_handler_default_case_returns_early(void)
+{
+	uint32_t frame_dest = 0xDEADBEEFu;
+	uint8_t  ts_bytes[8] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 };
+	uint8_t  ts_bytes_orig[8];
+	uint32_t byte_offset = 5;
+	memcpy(ts_bytes_orig, ts_bytes, sizeof(ts_bytes));
+
+	oa_tc6_timestamp_handler(&g_desc, 0, &frame_dest, ts_bytes, &byte_offset,
+				 (enum oa_tc6_ts_operation)99);
+
+	TEST_ASSERT_EQUAL_HEX32(0xDEADBEEFu, frame_dest);
+	TEST_ASSERT_EQUAL_UINT32(5, byte_offset);
+	TEST_ASSERT_EQUAL_MEMORY(ts_bytes_orig, ts_bytes, sizeof(ts_bytes));
+}
+
+/* ------ oa_tc6_end_data_chunk_processor --------------------------------------
+ * SV=0 + prior START -> commits frame, calls FCS check, advances valid_flag to END. */
+void test_end_data_chunk_processor_full_flow(void)
+{
+	uint32_t event = 0;
+	uint32_t oa_rx_footer = 0;
+	oa_rx_footer |= no_os_field_prep(OA_DATA_FOOTER_EBO_MASK, 63u);
+	/* SV=0, FD=0, SWO=0 */
+	g_desc.oa_valid_flag = OA_VALID_FLAG_START;
+	g_desc.oa_rx_cur_buf_byte_offset = 0;
+	g_desc.fcs_check_en = true;
+
+	calculate_fcs_IgnoreAndReturn(0);
+	net_queue_remove_entry_Ignore();
+
+	oa_tc6_end_data_chunk_processor(&g_desc, &event, g_rx_frame_buf,
+					oa_rx_footer, 0);
+
+	TEST_ASSERT_EQUAL_UINT(OA_VALID_FLAG_END, g_desc.oa_valid_flag);
+	TEST_ASSERT_EQUAL_UINT32(64, g_rx_buf_desc.trx_size);
+}
+
+/* ------ oa_tc6_start_data_chunk_processor ------------------------------------
+ * SV=1, EV=0, RTSA=0 -> takes the "start new frame" path and sets valid_flag=START. */
+void test_start_data_chunk_processor_new_frame(void)
+{
+	uint32_t event = 0;
+	uint32_t byte_offset = 0;
+	uint8_t  ts_bytes[8] = {0};
+	uint32_t oa_rx_footer = no_os_field_prep(OA_DATA_FOOTER_SV_MASK, 1u);
+
+	g_desc.oa_valid_flag = OA_VALID_FLAG_END;
+	g_desc.oa_rx_use_backup_buf = false;
+	g_desc.rx_queue_hp_en = false;
+	g_desc.num_ports = 1;
+
+	net_queue_is_empty_IgnoreAndReturn(false);
+
+	oa_tc6_start_data_chunk_processor(&g_desc, &event, &byte_offset, 0,
+					  ts_bytes, 64, g_rx_frame_buf,
+					  oa_rx_footer);
+
+	TEST_ASSERT_EQUAL_UINT(OA_VALID_FLAG_START, g_desc.oa_valid_flag);
+	TEST_ASSERT_EQUAL_UINT32(64, g_desc.oa_rx_cur_buf_byte_offset);
+}
+
+/* ------ oa_tc6_mid_data_chunk_processor --------------------------------------
+ * EV=0 + valid_flag=START + fits in buffer -> copies chunk bytes and advances offset. */
+void test_mid_data_chunk_processor_mid_frame(void)
+{
+	uint32_t event = 0;
+	uint32_t oa_rx_footer = 0;   /* EV=0 */
+	g_desc.oa_valid_flag = OA_VALID_FLAG_START;
+	g_desc.oa_rx_cur_buf_byte_offset = 0;
+
+	memset(spi_rx_buf, 0xAB, 64);
+	memset(g_rx_frame_buf, 0, sizeof(g_rx_frame_buf));
+
+	oa_tc6_mid_data_chunk_processor(&g_desc, 64, oa_rx_footer,
+					g_rx_frame_buf, &event, 0, 0);
+
+	TEST_ASSERT_EQUAL_UINT32(64, g_desc.oa_rx_cur_buf_byte_offset);
+	TEST_ASSERT_EQUAL_HEX8(0xAB, g_rx_frame_buf[0]);
+	TEST_ASSERT_EQUAL_HEX8(0xAB, g_rx_frame_buf[63]);
+}
+
+/* ------ oa_tc6_full_frame_in_chunk_process -----------------------------------
+ * fcs_size == FCS_SIZE -> "else" branch: flags FCS_ERROR, sets valid_flag=END. */
+void test_full_frame_in_chunk_process(void)
+{
+	uint32_t event = 0;
+	g_rx_buf_desc.trx_size = 0;
+
+	net_queue_remove_entry_Ignore();
+
+	oa_tc6_full_frame_in_chunk_process(&g_desc, &event, FCS_SIZE,
+					   g_rx_frame_buf);
+
+	TEST_ASSERT_TRUE(event & MAC_CALLBACK_STATUS_FCS_ERROR);
+	TEST_ASSERT_EQUAL_UINT(OA_VALID_FLAG_END, g_desc.oa_valid_flag);
+	TEST_ASSERT_EQUAL_UINT32(FCS_SIZE, g_rx_buf_desc.trx_size);
+}
+
+/* ------ oa_tc6_process_64_bit_timestamp --------------------------------------
+ * Chunk big enough for both halves -> oa_timestamp_split=false, byte_offset advanced by 8. */
+void test_process_64_bit_timestamp(void)
+{
+	uint32_t byte_offset = 0;
+	uint8_t  ts_bytes[16] = {0};
+	uint32_t chunk_start = 0;
+	uint32_t chunk_size = 64;
+
+	g_desc.oa_timestamp_parity = 0;
+	calculate_parity_IgnoreAndReturn(0);
+
+	oa_tc6_process_64_bit_timestamp(&g_desc, chunk_start, chunk_size,
+					ts_bytes, &byte_offset);
+
+	TEST_ASSERT_FALSE(g_desc.oa_timestamp_split);
+	TEST_ASSERT_EQUAL_UINT32(2u * OA_TIMESTAMP_32BIT_SIZE, byte_offset);
+}
+
+/* ------ oa_tc6_cb_function_caller --------------------------------------------
+ * num_ports=2 -> invokes both cb_func[MAC_EVT_DYN_TBL_UPDATE] and buf_desc->cb_func. */
+void test_cb_function_caller_num_ports_2(void)
+{
+	g_cb_dyn_calls = 0;
+	g_cb_buf_calls = 0;
+	g_cb_funcs[MAC_EVT_DYN_TBL_UPDATE] = g_cb_dyn_tbl_stub;
+	g_rx_buf_desc.cb_func = g_cb_buf_stub;
+
+	oa_tc6_cb_function_caller(&g_desc, 0, 0, 2);
+
+	TEST_ASSERT_EQUAL_UINT32(1, g_cb_dyn_calls);
+	TEST_ASSERT_EQUAL_UINT32(1, g_cb_buf_calls);
+	TEST_ASSERT_EQUAL_UINT32(0, g_desc.oa_rx_cur_buf_byte_offset);
+}
+
+/* ------ oa_tc6_create_next_chunk ---------------------------------------------
+ * No pending TX, empty RX -> tx_header DNC=1, NORX=1, DV=0. */
+void test_create_next_chunk_no_tx_no_rx_sets_norx(void)
+{
+	uint8_t buf[OA_HEADER_SIZE + 64] = {0};
+	net_queue_is_empty_ExpectAndReturn(g_rx_queue_ptr, true);
+	calculate_parity_IgnoreAndReturn(1);
+
+	(void)oa_tc6_create_next_chunk(&g_desc, buf, false);
+	uint32_t hdr = no_os_get_unaligned_be32(buf);
+	TEST_ASSERT_EQUAL_UINT32(1, no_os_field_get(OA_DATA_HEADER_DNC_MASK, hdr));
+	TEST_ASSERT_EQUAL_UINT32(1, no_os_field_get(OA_DATA_HEADER_NORX_MASK, hdr));
+	TEST_ASSERT_EQUAL_UINT32(0, no_os_field_get(OA_DATA_HEADER_DV_MASK, hdr));
+}
+
+/* ------ oa_tc6_spi_process ---------------------------------------------------
+ * Batches N chunks up to txc/rca/max_chunk_count. */
+void test_spi_process_batches_chunks(void)
+{
+	net_queue_is_empty_IgnoreAndReturn(true);
+	net_queue_is_full_IgnoreAndReturn(false);
+	calculate_parity_IgnoreAndReturn(1);
+	g_desc.oa_rca = 1;
+	g_desc.oa_txc = 0;
+	(void)oa_tc6_spi_process(&g_desc);
+	TEST_ASSERT_TRUE(g_desc.oa_trx_size >= OA_HEADER_SIZE + (1u << OA_DEFAULT_CPS));
+}
+
+/* ------ oa_tc6_end_data_transaction ------------------------------------------
+ * NOTE: this driver reads rx_footer AFTER the chunk loop even when oa_trx_size=0,
+ * which is UB. To keep the test deterministic we run one full chunk with a
+ * well-formed footer (SYNC=1, DV=0, EXST=0) so rx_footer is initialized and
+ * both queue-check branches fall through to the READY state. */
+void test_end_data_transaction_zero_trx_size_returns_success(void)
+{
+	uint32_t chunk_size = (1u << OA_DEFAULT_CPS);
+	uint32_t footer = no_os_field_prep(OA_DATA_FOOTER_SYNC_MASK, 1);
+	memset(spi_rx_buf, 0, chunk_size + OA_HEADER_SIZE);
+	memset(spi_tx_buf, 0, chunk_size + OA_HEADER_SIZE);
+	no_os_put_unaligned_be32(footer, &spi_rx_buf[chunk_size]);
+
+	g_desc.oa_trx_size = OA_HEADER_SIZE + chunk_size;
+	g_desc.oa_txc = 0;
+	g_desc.oa_rca = 0;
+	net_queue_is_empty_IgnoreAndReturn(true);
+	capi_irq_enable_IgnoreAndReturn(0);
+	calculate_parity_IgnoreAndReturn(1);
+
+	int ret = oa_tc6_end_data_transaction(&g_desc);
+	TEST_ASSERT_EQUAL_INT(0, ret);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_READY, g_desc.spi_state);
+}
+
+/*==============================================================================
+ * PHY / STATUS tests
+ *============================================================================*/
+
+/* ------ oa_tc6_read_status --------------------------------------------------- */
+void test_read_status_dispatches_ctrl_transfer(void)
+{
+	uint32_t mdio_cmd = 0;
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	(void)oa_tc6_read_status(&g_desc, &mdio_cmd);
+	TEST_ASSERT_NOT_EQUAL(OA_SPI_STATE_READY, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_phy_reg_read_start -------------------------------------------- */
+void test_phy_reg_read_start_builds_mdio_cmd(void)
+{
+	uint32_t mdio_cmd = 0;
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	(void)oa_tc6_phy_reg_read_start(&g_desc, &mdio_cmd, PHY_PORT_1_ADDRESS, 0x1E0000);
+	TEST_ASSERT_EQUAL_UINT32(PHY_PORT_1_ADDRESS,
+	                         no_os_field_get(MDIO_PRTAD_MASK, mdio_cmd));
+}
+
+/* ------ oa_tc6_phy_reg_read_step -------------------------------------------- */
+void test_phy_reg_read_step_progresses_state(void)
+{
+	uint32_t mdio_cmd = 0;
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	(void)oa_tc6_phy_reg_read_step(&g_desc, &mdio_cmd);
+	TEST_ASSERT_NOT_EQUAL(OA_SPI_STATE_READY, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_record_port_status -------------------------------------------
+ * With num_ports=1, record_port_status falls through to oa_tc6_spi_int_handle
+ * which requires ctrl_setup (calculate_parity) + SPI transceive mocks and
+ * transitions state to DATA_START. */
+void test_record_port_status_updates_desc(void)
+{
+	uint32_t mdio_cmd = 0;
+	mdio_cmd |= no_os_field_prep(MDIO_DATA_MASK, 0xABCD);
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+
+	oa_tc6_record_port_status(&g_desc, &mdio_cmd, 1);
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_DATA_START, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_read_phy_reg ------------------------------------------------- */
+void test_read_phy_reg_dispatches_spi(void)
+{
+	uint32_t mdio_cmd = 0;
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	(void)oa_tc6_read_phy_reg(&g_desc, &mdio_cmd);
+	TEST_ASSERT_NOT_EQUAL(OA_SPI_STATE_READY, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_spi_int_handle ----------------------------------------------- */
+void test_spi_int_handle_ready_returns_without_crash(void)
+{
+	g_desc.spi_state = OA_SPI_STATE_READ_STATUS;
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	capi_irq_enable_IgnoreAndReturn(0);
+	net_queue_is_empty_IgnoreAndReturn(true);
+	(void)oa_tc6_spi_int_handle(&g_desc);
+	TEST_PASS();
+}
+
+/*==============================================================================
+ * num_ports == 2 branch coverage
+ *   These target the code paths gated on `desc->num_ports == 2` that are not
+ *   otherwise exercised by the num_ports=1 tests above.
+ *============================================================================*/
+
+/* ------ oa_tc6_create_next_chunk (num_ports=2 path) --------------------------
+ * When num_ports=2 and a Tx frame is present, VS in the data header is loaded
+ * from frame->buf_desc->port. */
+void test_create_next_chunk_num_ports_2_sets_vs_from_port(void)
+{
+	uint8_t buf[OA_HEADER_SIZE + 64] = {0};
+
+	g_desc.num_ports = 2;
+	g_desc.oa_tx_cur_buf_byte_offset = 0;
+	g_desc.oa_tx_cur_buf_idx = 0;
+	g_tx_queue_storage.head = 0;
+	g_tx_queue_storage.tail = 0;
+	g_tx_buf_desc.port = 1;
+	g_tx_buf_desc.trx_size = 32;
+
+	net_queue_is_empty_IgnoreAndReturn(true);
+	net_queue_is_full_IgnoreAndReturn(true);
+	calculate_parity_IgnoreAndReturn(1);
+
+	(void)oa_tc6_create_next_chunk(&g_desc, buf, true);
+
+	uint32_t hdr = no_os_get_unaligned_be32(buf);
+	TEST_ASSERT_EQUAL_UINT32(1, no_os_field_get(OA_DATA_HEADER_DV_MASK, hdr));
+	TEST_ASSERT_EQUAL_UINT32(1, no_os_field_get(OA_DATA_HEADER_VS_MASK, hdr));
+}
+
+/* ------ oa_tc6_start_data_chunk_processor (num_ports=2 path) -----------------
+ * When num_ports=2 and SV=1 with VS bit0=1, buf_desc->port is captured from VS. */
+void test_start_data_chunk_processor_num_ports_2_sets_port(void)
+{
+	uint32_t event = 0;
+	uint32_t byte_offset = 0;
+	uint8_t  ts_bytes[8] = {0};
+	uint32_t oa_rx_footer = 0;
+	oa_rx_footer |= no_os_field_prep(OA_DATA_FOOTER_SV_MASK, 1u);
+	oa_rx_footer |= no_os_field_prep(OA_DATA_FOOTER_VS_MASK, 1u); /* bit0 = 1 */
+
+	g_desc.num_ports = 2;
+	g_desc.oa_valid_flag = OA_VALID_FLAG_END;
+	g_desc.oa_rx_use_backup_buf = false;
+	g_desc.rx_queue_hp_en = false;
+	g_rx_buf_desc.port = 0xFF;
+	net_queue_is_empty_IgnoreAndReturn(false);
+
+	oa_tc6_start_data_chunk_processor(&g_desc, &event, &byte_offset, 0,
+					  ts_bytes, 64, g_rx_frame_buf,
+					  oa_rx_footer);
+
+	TEST_ASSERT_EQUAL_UINT32(1, g_rx_buf_desc.port);
+	TEST_ASSERT_EQUAL_UINT(OA_VALID_FLAG_START, g_desc.oa_valid_flag);
+}
+
+/* ------ oa_tc6_record_port_status (num_ports=2, port_number=2 branch) --------
+ * With num_ports=2 and port_number=2, function selects p2_status registers.
+ * With p2_status_masked seeded to OA_PHY_STATUS_INIT_VAL, the CRSM branch runs
+ * and copies reg_data.lower (from *desc->reg_data) into p2_status.lower. */
+void test_record_port_status_num_ports_2_port_2(void)
+{
+	uint32_t mdio_cmd = 0;
+
+	g_desc.num_ports = 2;
+	g_reg_data = 0x0000ABCDu;
+	g_status_regs.p2_status = 0;
+	g_status_regs.p2_status_masked = OA_PHY_STATUS_INIT_VAL;
+
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+
+	oa_tc6_record_port_status(&g_desc, &mdio_cmd, 2);
+
+	TEST_ASSERT_EQUAL_HEX16(0xABCDu, (uint16_t)(g_status_regs.p2_status & 0xFFFFu));
+	TEST_ASSERT_NOT_EQUAL(OA_SPI_STATE_READY, g_desc.spi_state);
+}
+
+/* ------ oa_tc6_record_port_status (num_ports=1, port_number=2 -> early ret) -- */
+void test_record_port_status_num_ports_1_port_2_returns_early(void)
+{
+	uint32_t mdio_cmd = 0;
+
+	g_desc.num_ports = 1;
+	g_desc.spi_state = OA_SPI_STATE_READY;
+	g_status_regs.p2_status = 0xDEADBEEFu;
+
+	oa_tc6_record_port_status(&g_desc, &mdio_cmd, 2);
+
+	/* Early return: state unchanged, p2 registers untouched. */
+	TEST_ASSERT_EQUAL_UINT(OA_SPI_STATE_READY, g_desc.spi_state);
+	TEST_ASSERT_EQUAL_HEX32(0xDEADBEEFu, g_status_regs.p2_status);
+}
+
+/* ------ oa_tc6_read_status (num_ports=2 path) --------------------------------
+ * With num_ports=2 the p2_status/p2_status_masked registers are initialized
+ * to OA_PHY_STATUS_INIT_VAL, which the num_ports=1 path does not touch. */
+void test_read_status_num_ports_2_inits_p2_registers(void)
+{
+	uint32_t mdio_cmd = 0;
+
+	g_desc.num_ports = 2;
+	g_status_regs.p2_status = 0;
+	g_status_regs.p2_status_masked = 0;
+
+	calculate_parity_IgnoreAndReturn(1);
+	capi_spi_transceive_IgnoreAndReturn(0);
+	capi_spi_transceive_async_IgnoreAndReturn(0);
+	capi_spi_transceive_dma_async_IgnoreAndReturn(0);
+	capi_irq_enable_IgnoreAndReturn(0);
+	net_queue_is_empty_IgnoreAndReturn(true);
+
+	(void)oa_tc6_read_status(&g_desc, &mdio_cmd);
+
+	TEST_ASSERT_EQUAL_HEX32(OA_PHY_STATUS_INIT_VAL, g_status_regs.p2_status);
+	TEST_ASSERT_EQUAL_HEX32(OA_PHY_STATUS_INIT_VAL, g_status_regs.p2_status_masked);
+}
+
+/* ------ oa_tc6_cb_function_caller (num_ports=1 path skips dyn tbl callback) -- */
+void test_cb_function_caller_num_ports_1_skips_dyn_tbl(void)
+{
+	g_cb_dyn_calls = 0;
+	g_cb_buf_calls = 0;
+	g_cb_funcs[MAC_EVT_DYN_TBL_UPDATE] = g_cb_dyn_tbl_stub;
+	g_rx_buf_desc.cb_func = g_cb_buf_stub;
+
+	oa_tc6_cb_function_caller(&g_desc, 0, 0, 1);
+
+	TEST_ASSERT_EQUAL_UINT32(0, g_cb_dyn_calls); /* skipped when num_ports != 2 */
+	TEST_ASSERT_EQUAL_UINT32(1, g_cb_buf_calls);
+}
