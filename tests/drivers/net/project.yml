@@ -21,12 +21,19 @@
     - -:test/support
   :source:
     - ../../../drivers/net/standard_spi/
+    - ../../../drivers/net/oa_tc6/
+    - -:../../../drivers/net/oa_tc6/oa_tc6.c
+    - ../../../drivers/net/utilities/
+    - ../../../util/
+    - test/support/
+    - -:../../../capi/src/**
   :include:
     - test/support
     - ../../../include
     - ../../../capi/inc
     - ../../../capi/platform/stm32
     - ../../../drivers/net/standard_spi
+    - ../../../drivers/net/oa_tc6
     - ../../../drivers/net/utilities
   :support:
     - test/support
@@ -37,9 +44,11 @@
   :test:
     - *common_defines
     - TEST
+    - CONFIG_OA_ZERO_SWO_ONLY=0
   :test_preprocess:
     - *common_defines
     - TEST
+    - CONFIG_OA_ZERO_SWO_ONLY=0
 
 :cmock:
   :mock_prefix: mock_
