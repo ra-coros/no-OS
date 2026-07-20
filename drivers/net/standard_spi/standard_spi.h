@@ -147,7 +147,7 @@ enum standard_spi_timestamp_format {
 struct  standard_spi_desc  {
 	struct capi_spi_device *comm_desc;
 	volatile enum standard_spi_buffer_state spi_state;
-	void *device;
+	int num_ports;
 	bool crc_en;
 	bool rx_queue_hp_en;
 	bool fcs_check_en;
@@ -177,6 +177,7 @@ struct standard_spi_init_param {
 	bool rx_queue_hp_en;
 	bool fcs_check_en;
 	void *app_device;
+	int num_ports;
 	struct net_queue *tx_queue;
 	struct net_queue **rx_queue;
 	struct net_queue *rx_queue_lp;

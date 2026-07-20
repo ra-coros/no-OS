@@ -144,7 +144,12 @@ int standard_spi_init(struct standard_spi_desc **desc,
     d = *desc;                                           
 
     d->comm_desc = param->comm_param;
-    d->device = param->app_device;
+    d->num_ports = param->num_ports;
+    d->app_device = param->app_device;
+    d->tx_queue = param->tx_queue;
+    d->rx_queue = param->rx_queue;
+    d->rx_queue_lp = param->rx_queue_lp;
+    d->rx_queue_hp = param->rx_queue_hp;
     /* Implies state is uninitialized */
     d->rx_queue_hp_en = param->rx_queue_hp_en;
     d->fcs_check_en = param->fcs_check_en;
@@ -574,7 +579,7 @@ void spi_fifo_read_end(struct standard_spi_desc *desc)
         frame_entries[rx_queue->tail].buf_desc->trx_size -= FCS_SIZE;
         frame_entries[rx_queue->tail].buf_desc->prio = prio;
         
-        if (desc->device == (void *)1)
+        if (desc->num_ports == 2)
             frame_entries[rx_queue->tail].buf_desc->port = header.PORT;
 
         if (desc->fcs_check_en) {
@@ -588,7 +593,7 @@ void spi_fifo_read_end(struct standard_spi_desc *desc)
         tail = rx_queue->tail;
         net_queue_remove_entry(rx_queue);
 
-        if (desc->device == (void *)1 && 
+        if (desc->num_ports == 2 && 
             desc->cb_func[ADI_MAC_EVT_DYN_TBL_UPDATE] != NULL) 
                 desc->cb_func[ADI_MAC_EVT_DYN_TBL_UPDATE]((desc->app_device), 
                 desc->spi_error, frame_entries[tail].buf_desc);
