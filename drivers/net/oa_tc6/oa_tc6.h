@@ -37,6 +37,7 @@
 #include "capi_dma.h"
 #include "capi_gpio.h"
 #include "capi_irq.h"
+#include "capi_time.h"
 #include "no_os_util.h"
 #include "utilities.h"
 #include "net_queue.h"
@@ -558,6 +559,7 @@ struct oa_tc6_desc {
 
         volatile bool *pending_ctrl;
         struct eth_status_registers *status_regs;
+        uint32_t eth_irq;
         uint32_t *irq_mask0;
         uint32_t *irq_mask1;
         uint32_t *phy_irq_mask;
@@ -604,6 +606,7 @@ struct oa_tc6_init_param {
         bool rx_queue_hp_en;
         bool fcs_check_en;
         uint8_t num_ports;
+        uint32_t eth_irq;
 };
 
 /* Read a register from the MAC device */
