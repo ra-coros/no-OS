@@ -2368,11 +2368,17 @@ int oa_tc6_wait_spi_ready(struct oa_tc6_desc *const desc)
 int oa_tc6_init(struct oa_tc6_desc **desc, struct oa_tc6_init_param *param)
 {
 	struct oa_tc6_desc *descriptor;
-
-	descriptor = capi_calloc(1, sizeof(*descriptor));
-	if (!descriptor)
-		return -ENOMEM;
-
+        
+        if(desc == NULL || param == NULL)
+                return -EINVAL;
+        
+        if (param->dev_mem_size < sizeof(desc))
+                return -ENOMEM;;
+        
+        memset(param->p_dev_mem, 0, param->dev_mem_size);
+        *desc = (struct oa_tc6_desc *)param->p_dev_mem;
+        descriptor = *desc;
+    
         descriptor->comm_desc = param->comm_desc;
         descriptor->prote_spi = param->prote_spi;
         descriptor->rx_queue_hp_en = param->rx_queue_hp_en ;
@@ -2433,9 +2439,6 @@ int oa_tc6_init(struct oa_tc6_desc **desc, struct oa_tc6_init_param *param)
 		return ret;
 	}
 #endif
-
-	*desc = descriptor;
-
 	return 0;
 }
 
@@ -2449,7 +2452,9 @@ int oa_tc6_remove(struct oa_tc6_desc *desc)
 	if (!desc)
 		return -ENODEV;
 
-	capi_free(desc);
-
+        desc->spi_state = OA_SPI_STATE_UNINITIALIZED;
+        desc->comm_desc = NULL;
+        memset(desc, 0, sizeof(struct oa_tc6_desc));
+        
 	return 0;
 }
