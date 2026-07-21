@@ -165,14 +165,8 @@ LIB_PATHS			+= $(addprefix -L,$(EXTRA_LIBS_PATHS))
 
 #TODO remove afeter changes are done
 #Convert variable to linux.mk naming
-ifneq (aducm3029,$(strip $(PLATFORM)))
 INC_PATHS += $(EXTRA_INC_PATHS)
 LIBS += $(LIB_FLAGS)
-endif
-
-ifeq (mbed,$(strip $(PLATFORM)))
-CLEAN_MBED_OS = $(call remove_dir_action,$(MBED_OS_BUILD_DIRECTORY) $(MBED_APP_JSON_DIRECTORY))
-endif
 
 # Build project Release Configuration
 PHONY := libs
@@ -185,5 +179,4 @@ clean_libs:
 	-$(CLEAN_MQTT)
 	-$(CLEAN_IIO)
 	-$(CLEAN_AZURE)
-	-$(CLEAN_MBED_OS)
 	-$(CLEAN_TMC)
