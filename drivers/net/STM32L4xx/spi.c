@@ -95,9 +95,35 @@ int spi_init(struct bsp_spi_desc **desc, struct bsp_spi_init_param *param)
 	if (ret)
 		return ret;
 
-	d->cs_pin.port_handle = NULL;
+	struct stm32_capi_gpio_port_config cs_gpio_cfg = {
+		.mode      = GPIO_MODE_OUTPUT_PP,
+		.speed     = GPIO_SPEED_FREQ_LOW,
+		.pull      = GPIO_NOPULL,
+		.alternate = 0,
+	};
+
+	struct capi_gpio_port_config cs_port_cfg = {
+		.ops        = &stm32_capi_gpio_ops,
+		.identifier = (uint64_t)(uintptr_t)ETH_SPI_SS_GPIO_Port,
+		.num_pins   = 16,
+		.flags      = NULL,
+		.extra      = &cs_gpio_cfg,
+	};
+
+	ret = capi_gpio_port_init(&d->cs_pin.port_handle, &cs_port_cfg);
+	if (ret)
+		return ret;
+
 	d->cs_pin.number      = GPIO_PIN_NUM(ETH_SPI_SS_Pin);
-	d->cs_pin.flags       = CAPI_GPIO_ACTIVE_HIGH;
+	d->cs_pin.flags       = CAPI_GPIO_ACTIVE_LOW;
+
+	ret = capi_gpio_pin_set_direction(&d->cs_pin, CAPI_GPIO_OUTPUT);
+	if (ret)
+		return ret;
+
+	ret = capi_gpio_pin_set_raw_value(&d->cs_pin, CAPI_GPIO_HIGH);
+	if (ret)
+		return ret;
 
 	d->device.controller   = d->handle;
 	d->device.max_speed_hz = 0;
@@ -118,6 +144,9 @@ void spi_remove(struct bsp_spi_desc *desc)
 		return;
 
 	capi_irq_disable(ETH_SPI_IRQn);
+
+	if (desc->cs_pin.port_handle)
+		capi_gpio_port_deinit(&desc->cs_pin.port_handle);
 
 	if (desc->handle) {
 		capi_spi_deinit(desc->handle);
