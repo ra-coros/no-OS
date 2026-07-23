@@ -609,7 +609,7 @@ static int oa_tc6_start_data_transaction(struct oa_tc6_desc *const desc)
 		desc->spi_state = OA_SPI_STATE_READY;
 
 		if (!*(desc->pending_ctrl))
-			HAL_enableIrq(); //update this, not final, just placeholder
+			capi_irq_enable(desc->eth_irq);//HAL_enableIrq(); //update this, not final, just placeholder
 	}
 
 	return ret;
@@ -1547,7 +1547,7 @@ static int oa_tc6_state_machine(struct oa_tc6_desc *desc)
 
                 /* IRQ is enabled to ensure driver is responsive and     */
                 /* will not cause missed events.                         */
-                HAL_EnableIrq();
+                capi_irq_enable(desc->eth_irq);//HAL_EnableIrq();
         }
         
         return ret;
@@ -1710,7 +1710,7 @@ int oa_tc6_irq_handler (struct oa_tc6_desc *const desc)
 	HAL_OA_STATE_MACHINE_LOCK();
 	if (desc->spi_state == OA_SPI_STATE_READY)
 	{   
-		HAL_DisableIrq();
+		capi_irq_disable(desc->eth_irq);//HAL_DisableIrq();
 		(desc->spi_state) = OA_SPI_STATE_IRQ_START;
 		ret = oa_tc6_state_machine(desc);
 	}
@@ -2305,11 +2305,11 @@ int oa_tc6_wait_get_status(struct oa_tc6_desc *const desc, uint8_t *back_up, boo
 		
 		HAL_OA_STATE_MACHINE_LOCK();
 		if (desc->spi_state == OA_SPI_STATE_READY) 
-			*back_up = HAL_GetEnableIrq();
+			*back_up = capi_irq_get_enable(desc->eth_irq);//HAL_GetEnableIrq();
 
 		HAL_OA_STATE_MACHINE_UNLOCK();
 		
-		HAL_DisableIrq();
+		capi_irq_disable(desc->eth_irq);//HAL_DisableIrq();
 		*(desc->pending_ctrl) = true;
 
 		adi_hal_exit_critical_section(basepri);
@@ -2368,16 +2368,23 @@ int oa_tc6_wait_spi_ready(struct oa_tc6_desc *const desc)
 int oa_tc6_init(struct oa_tc6_desc **desc, struct oa_tc6_init_param *param)
 {
 	struct oa_tc6_desc *descriptor;
-
-	descriptor = capi_calloc(1, sizeof(*descriptor));
-	if (!descriptor)
-		return -ENOMEM;
-
+        
+        if(desc == NULL || param == NULL)
+                return -EINVAL;
+        
+        if (param->dev_mem_size < sizeof(desc))
+                return -ENOMEM;;
+        
+        memset(param->p_dev_mem, 0, param->dev_mem_size);
+        *desc = (struct oa_tc6_desc *)param->p_dev_mem;
+        descriptor = *desc;
+    
         descriptor->comm_desc = param->comm_desc;
         descriptor->prote_spi = param->prote_spi;
         descriptor->rx_queue_hp_en = param->rx_queue_hp_en ;
         descriptor->fcs_check_en = param->fcs_check_en;;
         descriptor->num_ports = param->num_ports;
+        descriptor->eth_irq = param->eth_irq;
 
         descriptor->spi_state = OA_SPI_STATE_READY;
         descriptor->spi_err = 0;
@@ -2433,9 +2440,6 @@ int oa_tc6_init(struct oa_tc6_desc **desc, struct oa_tc6_init_param *param)
 		return ret;
 	}
 #endif
-
-	*desc = descriptor;
-
 	return 0;
 }
 
@@ -2449,7 +2453,9 @@ int oa_tc6_remove(struct oa_tc6_desc *desc)
 	if (!desc)
 		return -ENODEV;
 
-	capi_free(desc);
-
+        desc->spi_state = OA_SPI_STATE_UNINITIALIZED;
+        desc->comm_desc = NULL;
+        memset(desc, 0, sizeof(struct oa_tc6_desc));
+        
 	return 0;
 }

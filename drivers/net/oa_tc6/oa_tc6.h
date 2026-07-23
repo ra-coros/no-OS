@@ -37,6 +37,7 @@
 #include "capi_dma.h"
 #include "capi_gpio.h"
 #include "capi_irq.h"
+#include "capi_time.h"
 #include "no_os_util.h"
 #include "utilities.h"
 #include "net_queue.h"
@@ -80,7 +81,6 @@
 
 #define     HAL_IPOS_UnlockSleepLock(...)
 
-
 /*! Size of the Tx queue, can be previously defined by the application. */
 #ifndef TX_QUEUE_NUM_ENTRIES
 #define TX_QUEUE_NUM_ENTRIES    4
@@ -100,6 +100,9 @@
 #ifndef TX_QUEUE_NUM_ENTRIES_RAW
 #define TX_QUEUE_NUM_ENTRIES_RAW        (TX_QUEUE_NUM_ENTRIES + 1)
 #endif
+
+/*! Size of the SPI device */
+#define OA_SPI_DEVICE_SIZE               (sizeof(struct oa_tc6_desc))
 
 /*! FCS size */
 #ifndef FCS_SIZE
@@ -392,6 +395,7 @@ enum oa_tc6_spi_state  {
         OA_SPI_STATE_IRQ_START,
         OA_SPI_STATE_READ_STATUS,
         OA_SPI_STATE_READ_PHY_REG,
+        OA_SPI_STATE_UNINITIALIZED,
 };
 
 struct reg_val {
@@ -555,6 +559,7 @@ struct oa_tc6_desc {
 
         volatile bool *pending_ctrl;
         struct eth_status_registers *status_regs;
+        uint32_t eth_irq;
         uint32_t *irq_mask0;
         uint32_t *irq_mask1;
         uint32_t *phy_irq_mask;
@@ -595,10 +600,13 @@ struct oa_tc6_desc {
  */
 struct oa_tc6_init_param {
         struct capi_spi_device *comm_desc;
+        void *p_dev_mem;                                                
+        uint32_t dev_mem_size;
         bool prote_spi;    
         bool rx_queue_hp_en;
         bool fcs_check_en;
         uint8_t num_ports;
+        uint32_t eth_irq;
 };
 
 /* Read a register from the MAC device */
