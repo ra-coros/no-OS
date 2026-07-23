@@ -721,11 +721,6 @@ static int stm32_capi_spi_transceive_dma_async(struct capi_spi_device *device,
 	if (priv_handle->async_in_progress)
 		return -EBUSY;
 
-	/* Set up CS GPIO if needed */
-	ret = setup_cs_gpio(priv_handle, device);
-	if (ret)
-		return ret;
-
 	/* Configure SPI for this device */
 	ret = stm32_capi_spi_config_peripheral(priv_handle, device);
 	if (ret)
@@ -735,8 +730,8 @@ static int stm32_capi_spi_transceive_dma_async(struct capi_spi_device *device,
 	priv_handle->async_in_progress = true;
 
 	/* Assert CS (drive low for active-low CS) */
-	if (priv_handle->cs_initialized)
-		capi_gpio_pin_set_raw_value(&priv_handle->chip_select, CAPI_GPIO_LOW);
+	if (device->cs_gpio)
+		capi_gpio_pin_set_raw_value(device->cs_gpio, CAPI_GPIO_LOW);
 
 	/* CS delay first */
 	if (dev_extra && dev_extra->cs_delay_first)
@@ -757,18 +752,16 @@ static int stm32_capi_spi_transceive_dma_async(struct capi_spi_device *device,
 					     transfer->rx_size);
 	} else {
 		priv_handle->async_in_progress = false;
-		/* Deassert CS on error */
-		if (priv_handle->cs_initialized)
-			capi_gpio_pin_set_raw_value(&priv_handle->chip_select, CAPI_GPIO_HIGH);
+		if (device->cs_gpio)
+			capi_gpio_pin_set_raw_value(device->cs_gpio, CAPI_GPIO_HIGH);
 		return -EINVAL;
 	}
 
 	if (hal_ret != HAL_OK) {
 		priv_handle->async_in_progress = false;
 		priv_handle->current_transfer = NULL;
-		/* Deassert CS on error */
-		if (priv_handle->cs_initialized)
-			capi_gpio_pin_set_raw_value(&priv_handle->chip_select, CAPI_GPIO_HIGH);
+		if (device->cs_gpio)
+			capi_gpio_pin_set_raw_value(device->cs_gpio, CAPI_GPIO_HIGH);
 		switch (hal_ret) {
 		case HAL_BUSY:
 			return -EBUSY;
