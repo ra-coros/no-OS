@@ -1,21 +1,36 @@
-name: Build Xilinx platform
+name: Build projects for Xilinx platform
 
 on:
   pull_request:
     branches:
       - main
       - next_stable
-      - release
+      - 'release/*'
       - '20*'
     paths-ignore:
       - '**/*.rst'
       - '**/*.md'
+      - 'drivers/platform/stm32/**'
+      - 'drivers/platform/pico/**'
+      - 'drivers/platform/aducm3029/**'
+      - 'drivers/platform/maxim/**'
+      - '.github/config/**'
+      - '.github/scripts/**'
   push:
     branches:
       - main
+      - next_stable
+      - 'release/*'
+      - '20*'
     paths-ignore:
       - '**/*.rst'
       - '**/*.md'
+      - 'drivers/platform/stm32/**'
+      - 'drivers/platform/pico/**'
+      - 'drivers/platform/aducm3029/**'
+      - 'drivers/platform/maxim/**'
+      - '.github/config/**'
+      - '.github/scripts/**'
 
 permissions:
   contents: read
@@ -28,7 +43,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build-xilinx-platform:
+  build-xilinx-projects:
     env:
       CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
       TOOLS_REPO: ${{ secrets.TOOLS_REPO }}
@@ -44,21 +59,15 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: false
-      - name: Setup Xilinx platform env
-        shell: sh
-        run: |
-          ${{ github.workspace }}/.github/scripts/setup-platform-env.sh
-        env:
-          PLATFORM: xilinx
-          WORKSPACE: ${{ github.workspace }}
-      - name: Build Xilinx projects
+      - name: Building for platform Xilinx 
         shell: sh
         run: |
           echo "Setup cloudsmith helper ..."
-          wget -P ./tools/scripts/ \
-            https://raw.githubusercontent.com/analogdevicesinc/wiki-scripts/refs/heads/main/utils/cloudsmith_utils/cloudsmith_helper.py -O ./tools/scripts/cloudsmith_temp.py
+          wget https://raw.githubusercontent.com/analogdevicesinc/wiki-scripts/refs/heads/main/utils/cloudsmith_utils/cloudsmith_helper.py \
+            -O ./tools/scripts/cloudsmith_temp.py
           cat tools/scripts/cloudsmith_temp.py | sed 's#/usr/bin/python3#/usr/bin/env python3#' > tools/scripts/cloudsmith_helper.py
-          
+          rm tools/scripts/cloudsmith_temp.py
+
           echo "Running project build ..."
           ${{ github.workspace }}/tools/scripts/build_projects.py \
             ${{ github.workspace }} \
