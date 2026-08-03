@@ -190,6 +190,11 @@
 #define ADIN_MAC_P2_ADDR_SLOT			3
 #define ADIN_MAC_FDB_ADDR_SLOT			4
 
+#define ADIN_DEV_PORT_NOP       (-1)   /*!< No port assigned.               */
+#define ADIN_DEV_PORT_1         (0)    /*!< Port 1.                         */
+#define ADIN_DEV_PORT_2         (1)    /*!< Port 2.                         */
+#define ADIN_DEV_PORT_NUM       (2)    /*!< Number of ports available.      */
+
 /**
  * @brief The chips supported by this driver.
  */
@@ -210,8 +215,12 @@ struct adin1110_desc {
 	struct no_os_gpio_desc *int_gpio;
 	bool oa_tc6_spi;
 	bool append_crc;
+    void *user_context;
 
+	struct standard_spi_desc *std_desc;
 	struct oa_tc6_desc *oa_desc;
+	struct eth_mac_desc *mac_desc;
+	struct spe_phy_desc *phy_desc;
 };
 
 /**
@@ -225,6 +234,12 @@ struct adin1110_init_param {
 	uint8_t mac_address[ADIN1110_ETH_ALEN];
 	bool append_crc;
 	bool oa_tc6_spi;
+    void *user_context;
+
+	struct standard_spi_init_param *std_init_param;
+	struct oa_tc6_init_param *oa_init_param;
+	struct eth_mac_init_param *mac_init_param;
+	struct spe_phy_init_param *phy_init_param;
 };
 
 /**
@@ -236,6 +251,19 @@ struct adin1110_eth_buff {
 	uint8_t mac_source[ADIN1110_ETH_ALEN];
 	uint8_t ethertype[2];
 	uint8_t *payload;
+};
+
+struct adin1110_device_id {
+    union {
+        struct {
+            uint32_t    rev_num      : 4;    /*!< Revision number.           */
+            uint32_t    model_num    : 6;    /*!< Model number.              */
+            uint32_t    oui         : 22;   /*!< OUI.                       */
+        };
+        uint32_t phy_id;
+    };
+    uint16_t        dig_rev_num;              /*!< Digital revision number.   */
+    uint8_t         pkg_type;                /*!< Package type.              */
 };
 
 /* Reset both the MAC and PHY. */
@@ -284,7 +312,7 @@ int adin1110_set_promisc(struct adin1110_desc *, uint32_t, bool);
  * forwarded to the host.
  */
 int adin1110_set_mac_addr(struct adin1110_desc *desc,
-			  uint8_t mac_address[ADIN1110_ETH_ALEN]);
+						  uint8_t mac_address[ADIN1110_ETH_ALEN]);
 
 /* Enable/disable the forwarding (to host) of broadcast frames */
 int adin1110_broadcast_filter(struct adin1110_desc *, bool);
@@ -300,5 +328,76 @@ int adin1110_init(struct adin1110_desc **, struct adin1110_init_param *);
 
 /* Free a device descriptor */
 int adin1110_remove(struct adin1110_desc *);
+
+int adin1110_get_device_id(struct adin1110_desc *, struct adin1110_device_id *)
+int adin1110_reset(struct adin1110_desc *, struct eth_mac_reset_type)
+int adin1110_set_promiscuous_mode(struct adin1110_desc *, bool )
+int adin1110_get_promiscuous_mode(struct adin1110_desc *, bool *)
+int adin1110_sync_config(struct adin1110_desc *)
+int adin1110_get_link_status(struct adin1110_desc *, enum eth_mac_link_status *)
+int adin1110_get_stat_counters(struct adin1110_desc *,
+							   struct eth_mac_stat_counter *)
+int adin1110_led_enable(struct adin1110_desc *, bool)
+int adin1110_set_loopback_mode(struct adin1110_desc *,
+							   enum spe_phy_loopback_mode)
+int adin1110_set_test_mode(struct adin1110_desc *, enum spe_phy_test_mode)
+int adin1110_add_address_filter(struct adin1110_desc *, uint8_t *, uint8_t *,
+								uint32_t, struct eth_mac_addr_rule)
+int adin1110_clear_address_filter(struct adin1110_desc *, uint32_t)
+int adin1110_submit_tx_buffer(struct adin1110_desc *, struct eth_mac_buf_desc *)
+int adin1110_submit_rx_buffer(struct adin1110_desc *, struct eth_mac_buf_desc *)
+int adin1110_set_chunk_size(struct adin1110_desc *, enum eth_mac_oa_cps)
+int adin1110_get_chunk_size(struct adin1110_desc *, enum eth_mac_oa_cps *)
+int adin1110_set_cut_through_mode(struct adin1110_desc *, bool, bool)
+int adin1110_get_cut_through_mode(struct adin1110_desc *, bool *, bool *)
+int adin1110_set_fifo_sizes(struct adin1110_desc *, struct eth_mac_fifo_size)
+int adin1110_get_fifo_sizes(struct adin1110_desc *, struct eth_mac_fifo_size *)
+int adin1110_clear_fifos(struct adin1110_desc *, enum eth_mac_fifo_clr_mode)
+int adin1110_ts_enable(struct adin1110_desc *, enum eth_mac_ts_format)
+int adin1110_ts_clear(struct adin1110_desc *)
+int adin1110_ts_timer_start(struct adin1110_desc *,
+							struct eth_mac_ts_timer_cfg *)
+int adin1110_ts_timer_stop(struct adin1110_desc *)
+int adin1110_ts_get_ext_capt_timestamp(struct adin1110_desc *,
+									   struct eth_mac_ts_timespec *)
+int adin1110_ts_set_timer_absolute(struct adin1110_desc *, uint32_t, uint32_t)
+int adin1110_ts_sync_clock(struct adin1110_desc *, int64_t, uint64_t, uint64_t)
+int adin1110_ts_get_egress_timestamp(struct adin1110_desc *,
+									 enum eth_mac_egress_capture,
+									 struct eth_mac_ts_timespec *)
+int adin1110_ts_convert(struct adin1110_desc *, uint32_t, uint32_t,
+						enum eth_mac_ts_format, struct eth_mac_ts_timespec *)
+int64_t adin1110_ts_subtract(struct adin1110_desc *, struct eth_mac_ts_timespec *,
+							 struct eth_mac_ts_timespec *)
+int adin1110_register_callback(struct adin1110_desc *, struct eth_mac_callback,
+							   enum eth_mac_event)
+int adin1110_write_register(struct adin1110_desc *, uint16_t, uint32_t)
+int adin1110_read_register(struct adin1110_desc *, uint16_t, uint32_t *)
+int adin1110_phy_write(struct adin1110_desc *, uint32_t, uint16_t)
+int adin1110_phy_read(struct adin1110_desc *, uint32_t, uint16_t *)
+int adin1110_enable(struct adin1110_desc *)
+int adin1110_disable(struct adin1110_desc *)
+int adin1110_get_mse_link_quality(struct adin1110_desc *,
+							  struct spe_phy_mse_link_quality *)
+int adin1110_frame_gen_enable(struct adin1110_desc *, bool)
+int adin1110_frame_gen_set_mode(struct adin1110_desc *,
+								enum spe_phy_frame_gen_mode)
+int adin1110_frame_gen_set_frame_count(struct adin1110_desc *, uint32_t)
+int adin1110_frame_gen_set_frame_payload(struct adin1110_desc *,
+										 enum spe_phy_frame_gen_payload)
+int adin1110_frame_gen_set_frame_len(struct adin1110_desc *, uint16_t)
+int adin1110_frame_gen_set_ifg_len(struct adin1110_desc *, uint16_t)
+int adin1110_frame_gen_restart(struct adin1110_desc *)
+int adin1110_frame_gen_done(struct adin1110_desc *, bool *)
+int adin1110_frame_check_enable(struct adin1110_desc *, bool)
+int adin1110_frame_check_source_select(struct adin1110_desc *,
+									   enum spe_phy_frame_check_source)
+int adin1110_frame_check_read_frame_count(struct adin1110_desc *, uint32_t *)
+int adin1110_frame_check_read_rx_err_count(struct adin1110_desc *, uint16_t *)
+int adin1110_frame_check_read_error_count(struct adin1110_desc *,
+							  struct spe_phy_frame_check_error_counters *)
+int adin1110_set_user_context(struct adin1110_desc *, void *)
+void *adin1110_get_user_context(struct adin1110_desc *)
+enum eth_mac_ts_format adin1110_get_timestamp_format(void)
 
 #endif

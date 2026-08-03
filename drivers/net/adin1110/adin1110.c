@@ -36,6 +36,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "no_os_spi.h"
+#include "capi_spi.h"
 #include "adin1110.h"
 #include "no_os_alloc.h"
 #include "no_os_crc8.h"
@@ -43,6 +44,8 @@
 #include "no_os_util.h"
 
 #include "oa_tc6.h"
+#include "eth_mac.h"
+#include "spe_phy.h"
 
 #define ADIN1110_CRC_POLYNOMIAL	0x7
 
@@ -908,6 +911,66 @@ static int adin1110_setup_phy(struct adin1110_desc *desc)
 	return 0;
 }
 
+static int adin1110_mac_read_async(struct adin1110_desc *desc, uint16_t reg_addr,
+				void *data, uint32_t byte_size, bool blocking)
+{
+	return oa_tc6_reg_read_async(desc->oa_desc, reg_addr, data, byte_size);
+}
+
+static int adin1110_mac_write_async(struct adin1110_desc *desc, uint16_t reg_addr,
+				void *data, uint32_t byte_size, bool blocking)
+{
+	return oa_tc6_reg_write_async(desc->oa_desc, reg_addr, data, byte_size);
+}
+
+static int adin1110_mac_wait_get_status(struct adin1110_desc *desc,
+						uint8_t *backup, bool control)
+{
+	return oa_tc6_wait_get_status(desc->oa_desc, backup, control);
+}
+
+static int adin1110_wait_spi_ready(struct adin1110_desc *desc)
+{
+	return oa_tc6_wait_spi_ready(desc->oa_desc);
+}
+
+static void adin1110_irq_handler(struct adin1110_desc *desc)
+{
+	return oa_tc6_irq_handler(desc->oa_desc);
+}
+
+static int adin1110_mac_reg_read(struct adin1110_desc *desc, uint16_t reg_addr,
+				void *data, uint32_t byte_size, bool blocking)
+{
+	return standard_spi_reg_read(desc->std_desc, reg_addr, data, byte_size,
+					blocking);
+
+}
+
+static int adin1110_mac_reg_write(struct adin1110_desc *desc, uint16_t reg_addr,
+				void *data, uint32_t byte_size, bool blocking)
+{
+	return standard_spi_reg_write(desc->std_desc, reg_addr, data, byte_size,
+					blocking);
+}
+			       
+static int adin1110_mac_fifo_write(struct adin1110_desc *desc,
+				struct eth_frame_struct *frame, bool blocking)
+{
+	return standard_spi_fifo_write(desc->std_desc, frame, blocking);
+}
+
+static int adin1110_mac_get_status(struct adin1110_desc *desc,
+						uint8_t *backup, bool control)
+{
+	return standard_spi_get_status(desc->std_desc, backup, control);
+}
+
+static int adin1110_is_spi_ready(struct adin1110_desc *desc)
+{
+	return is_spi_ready(desc->std_desc);
+}
+
 /**
  * @brief Enable CRC, interrupts and a MAC filter for the MAC device.
  * @param desc - the device descriptor
@@ -917,7 +980,7 @@ static int adin1110_setup_mac(struct adin1110_desc *desc)
 {
 	int ret;
 	uint32_t reg_val;
-
+	
 	ret = adin1110_reg_update(desc, ADIN1110_CONFIG2_REG, ADIN1110_CRC_APPEND,
 				  ADIN1110_CRC_APPEND);
 	if (ret)
@@ -944,6 +1007,9 @@ int adin1110_init(struct adin1110_desc **desc,
 		  struct adin1110_init_param *param)
 {
 	struct oa_tc6_init_param oa_param;
+	struct standard_spi_init_param *std_param;
+	struct eth_mac_init_param *mac_param;
+	struct spe_phy_init_param *phy_param;
 	struct adin1110_desc *descriptor;
 	int ret;
 
@@ -978,7 +1044,7 @@ int adin1110_init(struct adin1110_desc **desc,
 	if (ret)
 		goto free_rst_gpio;
 
-	no_os_crc8_populate_msb(_crc_table, ADIN1110_CRC_POLYNOMIAL);
+	// no_os_crc8_populate_msb(_crc_table, ADIN1110_CRC_POLYNOMIAL);
 	strncpy((char *)descriptor->mac_address, (char *)param->mac_address,
 		ADIN1110_MAC_LEN);
 
@@ -998,22 +1064,33 @@ int adin1110_init(struct adin1110_desc **desc,
 	descriptor->oa_tc6_spi = param->oa_tc6_spi;
 
 	if (descriptor->oa_tc6_spi) {
-		oa_param.comm_desc = descriptor->comm_desc;
-		ret = oa_tc6_init(&descriptor->oa_desc, &oa_param);
+		// oa_param.comm_desc = descriptor->comm_desc;
+		ret = oa_tc6_init(&descriptor->oa_desc, descriptor->oa_init_param);
 		if (ret)
 			goto free_spi;
 	} else {
-		descriptor->data = no_os_calloc(ADIN1110_BUFF_LEN,
-						sizeof(*descriptor->data));
-		if (!descriptor->data) {
-			ret = -ENOMEM;
+		// descriptor->data = no_os_calloc(ADIN1110_BUFF_LEN,
+						// sizeof(*descriptor->data));
+		// if (!descriptor->data) {
+			// ret = -ENOMEM;
+			// goto free_spi;
+		// }
+		ret = standard_spi_init(&descriptor->std_desc, descriptor->std_init_param);
+		if (ret)
 			goto free_spi;
-		}
 	}
+
+	ret = eth_mac_init(&descriptor->mac_desc, descriptor->mac_init_param);
+	if (ret)
+		goto free_mac;
 
 	ret = adin1110_setup_mac(descriptor);
 	if (ret)
 		goto free_oa;
+
+	ret = spe_phy_init(&descriptor->phy_desc, descriptor->phy_init_param);
+	if (ret)
+		goto free_phy;
 
 	ret = adin1110_setup_phy(descriptor);
 	if (ret)
@@ -1025,10 +1102,31 @@ int adin1110_init(struct adin1110_desc **desc,
 
 	*desc = descriptor;
 
+	if (desc->oa_tc6_spi)
+	{
+		desc->mac_desc->mac_read = adin1110_mac_read_async;
+		desc->mac_desc->mac_write = adin1110_mac_write_async;
+		desc->mac_desc->mac_get_comm_status = adin1110_mac_wait_get_status;
+		desc->mac_desc->mac_request_irq_handler = adin1110_irq_handler;
+		desc->mac_desc->mac_wait_until_ready = adin1110_wait_spi_ready;
+	}
+	else
+	{
+		desc->mac_desc->mac_read = adin1110_mac_reg_read;
+		desc->mac_desc->mac_write = adin1110_mac_reg_write;
+		desc->mac_desc->mac_write_frame = adin1110_mac_fifo_write;
+		desc->mac_desc->mac_get_comm_status = adin1110_mac_get_status;
+		desc->mac_desc->mac_wait_until_ready = adin1110_is_spi_ready;
+	}
+
 	return 0;
 
+free_phy:
+	spe_phy_remove(descriptor->phy_desc);
+free_mac:
+	eth_mac_remove(descriptor->mac_desc);
 free_oa:
-	no_os_free(descriptor->data);
+	// no_os_free(descriptor->data);
 	oa_tc6_remove(descriptor->oa_desc);
 free_spi:
 	no_os_spi_remove(descriptor->comm_desc);
@@ -1062,9 +1160,710 @@ int adin1110_remove(struct adin1110_desc *desc)
 			return ret;
 	}
 
-	no_os_free(desc->data);
+	// no_os_free(desc->data);
+	spe_phy_remove(desc->phy_desc);
+	eth_mac_remove(desc->mac_desc);
 	oa_tc6_remove(desc->oa_desc);
 	no_os_free(desc);
 
 	return 0;
+}
+
+int adin1110_get_device_id(struct adin1110_desc *desc,
+						   struct adin1110_device_id *dev_id)
+{
+    uint16_t val16 = 0;
+
+    if ((desc == NULL) || (dev_id == NULL))
+        return -EINVAL;
+
+    if (desc->mac_desc == NULL)
+        return -EINVAL;
+
+    result = adin1110_phy_read(desc->phy_desc, ADDR_MMD1_DEV_ID1, &val16);
+    if (result)
+        return result;
+
+    dev_id->phy_id = (val16 << 16);
+
+    result = adin1110_phy_read(desc->phy_desc, ADDR_MMD1_DEV_ID2, &val16);
+    if (result)
+        return result;
+
+    dev_id->phy_id |= val16;
+
+    result = adin1110_phy_read(desc->phy_desc, ADDR_MGMT_PRT_PKG, &val16);
+    if (result)
+        return result;
+
+    dev_id->pkg_type = val16;
+
+    result = adin1110_phy_read(desc->phy_desc, 0x1E900E, &val16);
+    if (result)
+        return result;
+
+    dev_id->dig_rev_num = val16 & 0xFF;
+
+    return 0;
+}
+
+int adin1110_reset(struct adin1110_desc *desc,
+				   struct eth_mac_reset_type reset_type)
+{
+    if ((desc == NULL) || (desc->mac_desc == NULL) || (desc->phy_desc == NULL))
+        return -EINVAL;
+
+    if ((resetType != ETH_MAC_RESET_TYPE_MAC_ONLY) &&
+        (resetType != ETH_MAC_RESET_TYPE_MAC_PHY))
+        return -EINVAL;
+
+	result = eth_mac_reset(desc->mac_desc, reset_type);
+	if ((result == 0) && (resetType == ETH_MAC_RESET_TYPE_MAC_PHY))
+	{
+		/* Re-initialize the PHY if needed */
+		return spe_phy_reinit_phy(desc->phy_desc);
+	}
+
+    return 0;
+}
+
+int adin1110_set_promiscuous_mode(struct adin1110_desc *desc, bool mode)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    if (desc->device != ADIN_1110)
+        return -ENODEV;
+
+    return eth_mac_set_promiscuous_mode(desc->mac_desc, mode);
+}
+
+int adin1110_get_promiscuous_mode(struct adin1110_desc *desc, bool *mode)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    if (desc->device != ADIN_1110)
+        return -ENODEV;
+
+    if (mode == NULL)
+        return ADI_ETH_INVALID_PARAM;
+
+    return eth_mac_get_promiscuous_mode(desc->mac_desc, mode);
+}
+
+int adin1110_sync_config(struct adin1110_desc *desc)
+{
+    if ((desc == NULL) || (desc->mac_desc == NULL))
+        return -EINVAL;
+
+    return eth_mac_sync_config(desc->mac_desc);
+}
+
+int adin1110_get_link_status(struct adin1110_desc *desc,
+							 enum eth_mac_link_status *link_status)
+{
+    int result = 0;
+
+	if ((desc == NULL) || (link_status == NULL) || (desc->mac_desc == NULL))
+        return -EINVAL;
+    
+	/* For OA SPI, wait for any in-progress SPI transaction  */
+	/* to complete before attempting register access.        */
+	if (desc->mac_desc->is_oa_spi_enabled)
+	{
+		result = adin1110_wait_spi_ready(desc);
+		if (result)
+			return result;
+	}
+	
+	return eth_mac_get_link_status(desc->mac_desc, 0, link_status);
+}
+
+int adin1110_get_stat_counters(struct adin1110_desc *desc,
+							   struct eth_mac_stat_counter *stat)
+{
+    int result = 0;
+    uint8_t retries = 0;
+    
+    if (desc == NULL)
+        return -EINVAL;
+
+    /* For OA SPI, wait for any in-progress SPI                     */
+    /* transaction to complete before attempting  register access.  */
+    if (!desc->mac_desc->is_oa_spi_enabled)
+	{
+        result = adin1110_wait_spi_ready(desc);
+        if (result)
+            return result;
+    }
+    
+    do {
+        result = eth_mac_get_stat_counters(desc->mac_desc, 0, stat);
+        if (result == 0)
+            break;
+		else
+            retries++;
+    } while(retries < 3 && result != 0);
+
+  return result;
+}
+
+int adin1110_led_enable(struct adin1110_desc *desc, bool enable)
+{
+    if ((desc == NULL) || (desc->phy_desc == NULL ))
+		return -EINVAL;
+
+	return spe_phy_LedEn(desc->phy_desc, ADI_PHY_LED_0, enable);
+}
+
+int adin1110_set_loopback_mode(struct adin1110_desc *desc,
+							   enum spe_phy_loopback_mode mode)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+	return spe_phy_SetLoopbackMode(desc->phy_desc, mode);
+
+
+int adin1110_set_test_mode(struct adin1110_desc *desc,
+							enum spe_phy_TestMode_e mode)
+{
+    if ((desc == NULL) || ( desc->phy_desc == NULL ))
+		return -EINVAL;
+
+	return spe_phy_SetTestMode(desc->phy_desc, mode);
+}
+
+int adin1110_add_address_filter(struct adin1110_desc *desc, uint8_t *mac_addr,
+								uint8_t *mac_addr_mask, uint32_t priority,
+								struct eth_mac_addr_rule rule)
+{
+    if ((desc == NULL) || (macAddr == NULL))
+        return -EINVAL;
+    
+    /* Address rules only make sense if TO_HOST=1,       */
+    /* because dropping frames is the default behaviour. */
+	rule.VALUE16 = 0;
+	rule.TO_HOST = 1;
+	rule.HOST_PRI = priority & 
+     (BITM_MAC_ADDR_FILT_UPR_N__HOST_PRI >> BITP_MAC_ADDR_FILT_UPR_N__HOST_PRI);
+	rule.APPLY2PORT1 = 1;
+
+    return eth_mac_add_address_filter(desc->mac_desc, mac_addr, mac_addr_mask,
+									  rule.VALUE16);
+}
+
+int adin1110_clear_address_filter(struct adin1110_desc *desc,
+									uint32_t addr_index)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    return eth_mac_clr_address_filter(desc->mac_desc, addr_index);
+}
+
+int adin1110_submit_tx_buffer(struct adin1110_desc *desc,
+								struct eth_mac_buf_desc *buf_desc)
+{
+    struct eth_mac_frame_header		header;
+
+    if ((desc == NULL) || if (buf_desc == NULL))
+        return -EINVAL;
+
+    if ((desc->mac_desc == NULL) || (desc->phy_desc == NULL))
+        return -EINVAL;
+
+	header.VALUE16 = 0x0000;
+	header.EGRESS_CAPTURE = buf_desc->egress_capt;   
+
+	/* For the ADIN1110, reference counter is always 1 */
+	buf_desc->ref_count = 1;
+
+	return eth_mac_submit_tx_buffer(desc->mac_desc, header, buf_desc);
+}
+
+int adin1110_submit_rx_buffer(struct adin1110_desc *desc,
+								struct eth_mac_buf_desc *buf_desc)
+{
+    if ((desc == NULL) || (buf_desc == NULL))
+        return -EINVAL;
+
+    return eth_mac_submit_rx_buffer(desc->mac_desc, buf_desc);
+}
+
+int adin1110_set_chunk_size(struct adin1110_desc *desc, enum eth_mac_oa_cps cps)
+{
+    if ((desc == NULL) || (cps > ADI_MAC_OA_CPS_64BYTE) ||
+		(desc->mac_desc == NULL))
+        return -EINVAL;
+
+    return eth_mac_set_chunk_size(desc->mac_desc, cps);
+}
+
+int adin1110_get_chunk_size(struct adin1110_desc *desc, 
+							enum eth_mac_oa_cps *cps)
+{
+    if ((desc == NULL) || (cps == NULL))
+        return -EINVAL;
+
+    return eth_mac_get_chunk_size(desc->mac_desc, cps);
+}
+
+int adin1110_set_cut_through_mode(struct adin1110_desc *desc, bool tx_cte,
+									bool rx_cte)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+	return eth_mac_set_cut_through_mode(desc->mac_desc, tx_cte, rx_cte);
+}
+
+int adin1110_get_cut_through_mode(struct adin1110_desc *desc, bool *tx_cte,
+									bool *rx_cte)
+{
+    if ((desc == NULL) || (tx_cte == NULL) || (rx_cte == NULL))
+        return -EINVAL;
+
+	return eth_mac_get_cut_through_mode(desc->mac_desc, tx_cte, rx_cte);
+}
+
+int adin1110_set_fifo_sizes(struct adin1110_desc *desc,
+							struct eth_mac_fifo_size fifo_sizes)
+{
+    uint32_t write_val;
+    uint32_t total_size;
+
+    if (desc == NULL)
+        return -EINVAL;
+
+	total_size	=	(2 * (uint32_t)fifo_sizes.txSize)	+
+					(2 * (uint32_t)fifo_sizes.rxLoSize)	+ 
+					(2 * (uint32_t)fifo_sizes.rxHiSize);
+
+	if (total_size > ETH_MAC_FIFO_MAX_SIZE)
+		return -ERANGE;
+
+	write_val =	(fifo_sizes.txSize << BITP_MAC_FIFO_SIZE_HTX_SIZE)			|
+				(fifo_sizes.rxLoSize << BITP_MAC_FIFO_SIZE_P1_RX_LO_SIZE)	|
+				(fifo_sizes.rxHiSize << BITP_MAC_FIFO_SIZE_P1_RX_HI_SIZE);
+
+	return eth_mac_set_fifo_sizes(desc->mac_desc, write_val);
+}
+
+int adin1110_get_fifo_sizes(struct adin1110_desc *desc,
+							struct eth_mac_fifo_size *fifo_sizes)
+{
+    int			result = 0;
+    uint32_t	read_val;
+
+    if ((desc == NULL) || (fifo_sizes == NULL))
+        return -EINVAL;
+
+	result = eth_mac_get_fifo_sizes(desc->mac_desc, &read_val);
+
+	fifo_sizes->txSize    = (eth_mac_HtxFifoSize_e)((read_val &
+							 BITM_MAC_FIFO_SIZE_HTX_SIZE) >>
+							 BITP_MAC_FIFO_SIZE_HTX_SIZE);
+	fifo_sizes->rxLoSize  = (eth_mac_RxFifoSize_e)((read_val &
+							 BITM_MAC_FIFO_SIZE_P1_RX_LO_SIZE) >>
+							 BITP_MAC_FIFO_SIZE_P1_RX_LO_SIZE);
+	fifo_sizes->rxHiSize  = (eth_mac_RxFifoSize_e)((read_val &
+							 BITM_MAC_FIFO_SIZE_P1_RX_HI_SIZE) >>
+							 BITP_MAC_FIFO_SIZE_P1_RX_HI_SIZE);
+    return result;
+}
+
+int adin1110_clear_fifos(struct adin1110_desc *desc,
+					     enum eth_mac_fifo_clr_mode clear_mode)
+{
+    bool mode_found = false;
+
+    if (desc == NULL)
+        return -EINVAL;
+
+    for (enum eth_mac_fifo_clr_mode mode = ETH_MAC_CLEAR_ALL_FIFOS;
+         mode <= ETH_MAC_CLEAR_P2P_FIFOS; mode++)
+    {
+        if (mode == clear_mode)
+        {
+            mode_found = true;
+            break;
+        }
+    }
+
+    if (!mode_found)
+        return -EINVAL;
+
+  
+    if (ETH_MAC_CLEAR_P2P_FIFOS % clear_mode)
+        return -EINVAL;
+
+    return eth_mac_clear_fifo(desc->mac_desc, clear_mode);
+}
+
+int adin1110_ts_enable(struct adin1110_desc *desc, 
+						enum eth_mac_ts_format format)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    /* Update SPI device timestampFormat for OA SPI timestamp processing */
+    if (desc->oa_tc6_spi)
+    {
+        desc->oa_desc->ts_format = (enum oa_tc6_ts_format)format;
+    } else 
+    {
+        desc->std_desc->ts_format = (enum standard_spi_timestamp_format)format;
+    }
+
+    return eth_mac_ts_enable(desc->mac_desc, format);
+}
+
+int adin1110_ts_clear(struct adin1110_desc *desc)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    return eth_mac_ts_clear(desc->mac_desc);
+}
+
+int adin1110_ts_timer_start(struct adin1110_desc *desc,
+							struct eth_mac_ts_timer_cfg *timer_config)
+{
+    if ((desc == NULL) || (timer_config == NULL))
+        return -EINVAL;
+
+    return eth_mac_ts_timer_start(desc->mac_desc, timer_config);
+}
+
+int adin1110_ts_timer_stop(struct adin1110_desc *desc)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    return eth_mac_ts_timer_stop(desc->mac_desc);
+}
+
+int adin1110_ts_get_ext_capt_timestamp(struct adin1110_desc *desc,
+								  struct eth_mac_ts_timespec *captured_timespec)
+{
+    if ((desc == NULL) || (captured_timespec == NULL))
+        return -EINVAL;
+
+    return eth_mac_ts_get_ext_capt_timestamp(desc->mac_desc, captured_timespec);
+}
+
+int adin1110_ts_set_timer_absolute(struct adin1110_desc *desc, uint32_t seconds,
+								   uint32_t nanoseconds)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    return eth_mac_ts_set_timer_absolute(desc->mac_desc, seconds, nanoseconds);
+}
+
+int adin1110_ts_sync_clock(struct adin1110_desc *desc, int64_t time_error,
+				   uint64_t reference_time_ns_diff, uint64_t local_time_ns_diff)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    return eth_mac_ts_sync_clock(desc->mac_desc, time_error,
+								 reference_time_ns_diff, local_time_ns_diff);
+}
+
+int adin1110_ts_get_egress_timestamp(struct adin1110_desc *desc,
+								  enum eth_mac_egress_capture egress_reg,
+								  struct eth_mac_ts_timespec *captured_timespec)
+{
+    if ((desc == NULL) || (captured_timespec == NULL))
+        return -EINVAL;
+    
+    return eth_mac_ts_get_egress_timestamp(desc->mac_desc, egress_reg,
+										   captured_timespec);
+}
+
+int adin1110_ts_convert(struct adin1110_desc *desc, uint32_t timestamp_low_word,
+						uint32_t timestamp_high_word,
+						enum eth_mac_ts_format format,
+						struct eth_mac_ts_timespec *timespec)
+{
+    if ((desc == NULL) || (timespec == NULL))
+        return -EINVAL;
+
+    return eth_mac_ts_convert(timestamp_low_word, timestamp_high_word, format,
+							  timespec);
+}
+
+int64_t adin1110_ts_subtract(struct adin1110_desc *desc,
+							 struct eth_mac_ts_timespec *ts_a,
+							 struct eth_mac_ts_timespec *ts_b)
+{
+    if ((desc == NULL) || (ts_a == NULL) || (ts_b == NULL))
+        return -EINVAL;
+
+    return eth_mac_ts_subtract(ts_a, ts_b);
+}
+
+int adin1110_register_callback(struct adin1110_desc *desc,
+							   struct eth_mac_callback cb_func,
+							   enum eth_mac_event cb_event)
+{
+    if ((desc == NULL) || (cb_func == NULL) || (cb_event >= ETH_MAC_EVT_MAX))
+        return -EINVAL;
+
+    return eth_mac_register_callback(desc->mac_desc, cb_func, cb_event,
+									 (void *)desc);
+}
+
+int adin1110_write_register(struct adin1110_desc *desc, uint16_t reg_addr,
+						   uint32_t reg_data)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    return eth_mac_write_register(desc->mac_desc, reg_addr, reg_data);
+}
+
+int adin1110_read_register(struct adin1110_desc *desc, uint16_t reg_addr,
+						  uint32_t *reg_data)
+{
+	int result = 0;
+
+	if ((desc == NULL) || (reg_data == NULL))
+        return -EINVAL;
+
+    /* For OA SPI, wait for any in-progress SPI transaction to complete */
+    /* before attempting register access. This prevents timeout errors  */
+    /* when the IRQ handler is actively processing frame data.          */
+    if (desc->mac_desc->is_oa_spi_enabled)
+    {
+        result = adin1110_wait_spi_ready(desc);
+		if (result)
+            return result;
+    }
+
+    return eth_mac_read_register(desc->mac_desc, reg_addr, reg_data);
+}
+
+int adin1110_phy_write(struct adin1110_desc *desc, uint32_t reg_addr,
+					   uint16_t reg_data)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+	return eth_mac_phy_write(desc->mac_desc, desc->phy_desc->phyAddr, reg_addr,
+						     reg_data);
+}
+
+int adin1110_phy_read(struct adin1110_desc *desc, uint32_t reg_addr,
+					  uint16_t *reg_data)
+{
+    if ((desc == NULL) || (reg_data == NULL))
+        return -EINVAL;
+
+	return eth_mac_phy_read(desc->mac_desc, desc->phy_desc->phyAddr, reg_addr,
+							reg_data);
+}
+
+int adin1110_enable(struct adin1110_desc *desc)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    if (desc->device != ADIN_1110)
+        return -ENODEV;
+
+    return spe_phy_exit_software_powerdown(desc->phy_desc);
+}
+
+int adin1110_disable(struct adin1110_desc *desc)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    if (desc->device != ADIN_1110)
+        return -ENODEV;
+
+    return spe_phy_enter_software_powerdown(desc->phy_desc);
+}
+
+int adin1110_get_mse_link_quality(struct adin1110_desc *desc,
+							  struct spe_phy_mse_link_quality *mse_link_quality)
+{
+    if ((desc == NULL) || (mse_link_quality == NULL))
+        return -EINVAL;
+
+	return spe_phy_get_mse_link_quality(desc->phy_desc, mse_link_quality);
+}
+
+int adin1110_frame_gen_enable(struct adin1110_desc *desc, bool enable)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+	return spe_phy_frame_gen_enable(desc->phy_desc, enable);
+}
+
+int adin1110_frame_gen_set_mode(struct adin1110_desc *desc,
+								enum spe_phy_frame_gen_mode mode)
+{
+    if ((desc == NULL) || (mode > SPE_PHY_FRAME_GEN_MODE_CONT))
+        return -EINVAL;
+
+	return spe_phy_frame_gen_set_mode(desc->phy_desc, mode);
+}
+
+int adin1110_frame_gen_set_frame_count(struct adin1110_desc *desc,
+									   uint32_t frame_count)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+	return spe_phy_frame_gen_set_frame_count(desc->phy_desc, frame_count);
+}
+
+int adin1110_frame_gen_set_frame_payload(struct adin1110_desc *desc,
+										 enum spe_phy_frame_gen_payload payload)
+{
+    bool payload_found = false;
+
+    if (desc == NULL)
+        return -EINVAL;
+
+    for (enum spe_phy_frame_gen_payload payload_type = SPE_PHY_FRAME_GEN_PAYLOAD_NONE;
+         payload_type <= SPE_PHY_FRAME_GEN_PAYLOAD_DECR; payload_type++)
+    {
+        if (payload_type == payload)
+        {
+            payload_found = true;
+            break;
+        }
+    }
+
+    if (!payload_found)
+        return -EINVAL;
+
+	return spe_phy_frame_gen_set_frame_payload(desc->phy_desc, payload);
+}
+
+int adin1110_frame_gen_set_frame_len(struct adin1110_desc *desc,
+									 uint16_t frame_len)
+{
+    if ((desc == NULL) || (frame_len < 46) || (frame_len > 1518))
+        return -EINVAL;
+
+	return spe_phy_frame_gen_set_frame_len(desc->phy_desc, frame_len);
+}
+
+int adin1110_frame_gen_set_ifg_len(struct adin1110_desc *desc, uint16_t ifg_len)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+	return spe_phy_frame_gen_set_ifg_len(desc->phy_desc, ifg_len);
+}
+
+int adin1110_frame_gen_restart(struct adin1110_desc *desc)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+	return spe_phy_frame_gen_restart(desc->phy_desc);
+}
+
+int adin1110_frame_gen_done(struct adin1110_desc *desc, bool *done)
+{
+    if ((desc == NULL) || (done == NULL))
+        return -EINVAL;
+
+	return spe_phy_frame_gen_done(desc->phy_desc, done);
+}
+
+int adin1110_frame_check_enable(struct adin1110_desc *desc, bool enable)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+	return spe_phy_check_enable(desc->phy_desc, enable);
+}
+
+int adin1110_frame_check_source_select(struct adin1110_desc *desc,
+									   enum spe_phy_frame_check_source source)
+{
+    if ((desc == NULL) || ((source != SPE_PHY_FRAME_CHK_SOURCE_MAC) &&
+        (source != SPE_PHY_FRAME_CHK_SOURCE_PHY)))
+        return -EINVAL;
+    
+	return spe_phy_frame_check_source_select(desc->phy_desc, source);
+}
+
+int adin1110_frame_check_read_frame_count(struct adin1110_desc *desc,
+										  uint32_t *count)
+{
+    if ((desc == NULL) || (count == NULL))
+        return -EINVAL;
+
+	return spe_phy_frame_check_read_frame_count(desc->phy_desc, count);
+}
+
+int adin1110_frame_check_read_rx_err_count(struct adin1110_desc *desc,
+										    uint16_t *count)
+{
+    if ((desc == NULL) || (count == NULL))
+        return -EINVAL;
+
+	return spe_phy_frame_check_read_rx_err_count(desc->phy_desc, count);
+}
+
+int adin1110_frame_check_read_error_count(struct adin1110_desc *desc,
+							  struct spe_phy_frame_check_error_counters *count)
+{
+    if ((desc == NULL) || (count == NULL))
+        return -EINVAL;
+
+	return spe_phy_frame_check_read_error_count(desc->phy_desc, count);
+}
+
+int adin1110_set_user_context(struct adin1110_desc *desc, void *context)
+{
+    if (desc == NULL)
+        return -EINVAL;
+
+    if (desc->device != ADIN_1110)
+        return -ENODEV;
+
+    if ((desc->phy_desc == NULL)                                ||
+        (desc->phy_desc->state == SPE_PHY_STATE_UNINITIALIZED)	||
+        (desc->mac_desc == NULL)                                ||
+        (desc->mac_desc->state == ETH_MAC_STATE_UNINITIALIZED))
+    {
+        return -EBADF;
+    }
+
+    desc->user_context = context;
+
+    return 0;
+}
+
+void *adin1110_get_user_context(struct adin1110_desc *desc)
+{
+    if (desc == NULL)
+        return NULL;
+
+    if ((desc->phy_desc == NULL)                                ||
+        (desc->phy_desc->state == SPE_PHY_STATE_UNINITIALIZED)	||
+        (desc->mac_desc == NULL)                                ||
+        (desc->mac_desc->state == ETH_MAC_STATE_UNINITIALIZED))
+    {
+        return NULL;
+    }
+
+    return desc->user_context;
+}
+
+enum eth_mac_ts_format adin1110_get_timestamp_format(void)
+{
+	return timestamp_format;
 }
