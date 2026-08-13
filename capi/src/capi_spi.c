@@ -56,6 +56,16 @@ int capi_spi_transceive_async(struct capi_spi_device *device,
 	return device->controller->ops->transceive_async(device, transfer, 0);
 }
 
+int capi_spi_transceive_dma_async(struct capi_spi_device *device,
+			      struct capi_spi_transfer *transfer)
+{
+	if (!device || !device->controller || !device->controller->ops ||
+	    !device->controller->ops->transceive_async) {
+		return -EINVAL;
+	}
+	return device->controller->ops->transceive_async(device, transfer, 0);
+}
+
 int capi_spi_read_command(struct capi_spi_device *device,
 			  struct capi_spi_transfer *transfer)
 {
