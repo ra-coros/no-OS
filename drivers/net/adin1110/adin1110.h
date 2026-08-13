@@ -37,9 +37,26 @@
 #include <stdbool.h>
 #include "no_os_spi.h"
 #include "no_os_gpio.h"
+
+#include "capi_spi.h"
+#include "capi_gpio.h"
+
 #include "no_os_util.h"
 
 #include "oa_tc6.h"
+#include "standard_spi.h"
+#include "eth_mac.h"
+#include "spe_phy.h"
+
+/*! Reserved space for struct adin1110_desc at end of devMem pool */
+#define ADIN1110_DESC_RESERVE			64
+
+/*! Size of memory required for ADIN1110 device structure  when OPEN Alliance SPI mode is disabled. */
+ #define ADIN1110_DEVICE_SIZE           (SPE_PHY_DEVICE_SIZE + ETH_MAC_DEVICE_SIZE + ADI_SPI_DEVICE_SIZE + ADIN1110_DESC_RESERVE)
+
+/*! Size of memory required for ADIN1110 device structure  when OPEN Alliance SPI mode is enabled. */
+ #define ADIN1110_DEVICE_SIZE_OA        (SPE_PHY_DEVICE_SIZE + ETH_MAC_DEVICE_SIZE + OA_SPI_DEVICE_SIZE + ADIN1110_DESC_RESERVE)
+
 
 #define ADIN1110_BUFF_LEN			1530
 #define ADIN1110_ETH_ALEN			6
@@ -184,48 +201,68 @@
 #define ADIN1110_CRC_LEN			1
 #define ADIN1110_FEC_LEN			4
 
+#define ADIN1110_PHY_ADDR			1
+#define ADIN1110_PHY_IRQ_MASK		0x1BFFU
+
 #define ADIN_MAC_MULTICAST_ADDR_SLOT		0
 #define ADIN_MAC_BROADCAST_ADDR_SLOT		1
 #define ADIN_MAC_P1_ADDR_SLOT			2
 #define ADIN_MAC_P2_ADDR_SLOT			3
 #define ADIN_MAC_FDB_ADDR_SLOT			4
 
-/**
- * @brief The chips supported by this driver.
- */
-enum adin1110_chip_id {
-	ADIN1110,
-	ADIN2111,
-};
+#define ADIN_DEV_PORT_NOP       (-1)   /*!< No port assigned.               */
+#define ADIN_DEV_PORT_1         (0)    /*!< Port 1.                         */
+#define ADIN_DEV_PORT_2         (1)    /*!< Port 2.                         */
+#define ADIN_DEV_PORT_NUM       (2)    /*!< Number of ports available.      */
 
 /**
  * @brief ADIN1110 device descriptor.
  */
 struct adin1110_desc {
-	enum adin1110_chip_id chip_type;
-	struct no_os_spi_desc *comm_desc;
+	enum eth_devices chip_type;
+	struct capi_spi_device *comm_desc;
 	uint8_t mac_address[ADIN1110_ETH_ALEN];
 	uint8_t *data;
-	struct no_os_gpio_desc *reset_gpio;
-	struct no_os_gpio_desc *int_gpio;
+	struct capi_gpio_pin *reset_gpio;
+	struct capi_gpio_pin *int_gpio;
 	bool oa_tc6_spi;
 	bool append_crc;
+	void *user_context;
 
+	struct standard_spi_desc *std_desc;
 	struct oa_tc6_desc *oa_desc;
+	struct eth_mac_desc *mac_desc;
+	struct spe_phy_desc *phy_desc;
 };
+
 
 /**
  * @brief Initialization parameter for the device descriptor.
  */
 struct adin1110_init_param {
-	enum adin1110_chip_id chip_type;
-	struct no_os_spi_init_param comm_param;
-	struct no_os_gpio_init_param reset_param;
-	struct no_os_gpio_init_param int_param;
+	void *dev_mem;
+	uint32_t dev_mem_size;
+	enum eth_devices chip_type;
+
+	struct capi_spi_device *comm_desc;
+	struct capi_gpio_pin *reset_gpio;
+	struct capi_gpio_pin *int_gpio;
 	uint8_t mac_address[ADIN1110_ETH_ALEN];
+        
+	bool fcs_check_en;
 	bool append_crc;
 	bool oa_tc6_spi;
+	bool oa_tc6_prote_en;
+	bool rx_queue_hp_en;
+	void *user_context;
+
+	struct standard_spi_init_param *std_init_param;
+	struct oa_tc6_init_param *oa_init_param;
+	struct eth_mac_init_param *mac_init_param;
+	struct spe_phy_init_param *phy_init_param;
 };
+
+
 
 /**
  * @brief Buffer structure used for frame RX and TX transactions.
@@ -237,6 +274,21 @@ struct adin1110_eth_buff {
 	uint8_t ethertype[2];
 	uint8_t *payload;
 };
+
+struct adin1110_device_id {
+    union {
+        struct {
+            uint32_t    rev_num      : 4;    /*!< Revision number.           */
+            uint32_t    model_num    : 6;    /*!< Model number.              */
+            uint32_t    oui         : 22;   /*!< OUI.                       */
+        };
+        uint32_t phy_id;
+    };
+    uint16_t        dig_rev_num;              /*!< Digital revision number.   */
+    uint8_t         pkg_type;                /*!< Package type.              */
+};
+
+int adin1110_init_new(struct adin1110_desc **desc, struct adin1110_init_param *param);
 
 /* Reset both the MAC and PHY. */
 int adin1110_sw_reset(struct adin1110_desc *);
@@ -300,5 +352,164 @@ int adin1110_init(struct adin1110_desc **, struct adin1110_init_param *);
 
 /* Free a device descriptor */
 int adin1110_remove(struct adin1110_desc *);
+
+/* Reset the MAC, and optionally the PHY. */
+int adin1110_reset(struct adin1110_desc *desc, struct eth_mac_reset_type reset_type);
+
+/* Enable promiscuous mode (ADIN1110 only). */
+int adin1110_set_promiscuous_mode(struct adin1110_desc *desc, bool mode);
+
+/* Get current promiscuous mode state (ADIN1110 only). */
+int adin1110_get_promiscuous_mode(struct adin1110_desc *desc, bool *mode);
+
+/* Synchronize MAC configuration registers. */
+int adin1110_sync_config(struct adin1110_desc *desc);
+
+/* Get the current link status for port 0. */
+int adin1110_get_link_status(struct adin1110_desc *desc, enum eth_mac_link_status *link_status);
+
+/* Read MAC statistic counters with retry on failure. */
+int adin1110_get_stat_counters(struct adin1110_desc *desc, struct eth_mac_stat_counter *stat);
+
+/* Enable or disable PHY LED_0. */
+int adin1110_led_enable(struct adin1110_desc *desc, bool enable);
+
+/* Set PHY loopback mode. */
+int adin1110_set_loopback_mode(struct adin1110_desc *desc, enum spe_phy_LoopbackMode_e mode);
+
+/* Set PHY test mode. */
+int adin1110_set_test_mode(struct adin1110_desc *desc, enum spe_phy_TestMode_e mode);
+
+/* Add a MAC address filter entry with the given priority and rule. */
+int adin1110_add_address_filter(struct adin1110_desc *desc, uint8_t *mac_addr, uint8_t *mac_addr_mask, uint32_t priority, struct eth_mac_addr_rule rule);
+
+/* Clear a MAC address filter entry by index. */
+int adin1110_clear_address_filter(struct adin1110_desc *desc, uint32_t addr_index);
+
+/* Submit a frame buffer for transmission. */
+int adin1110_submit_tx_buffer(struct adin1110_desc *desc, struct eth_mac_buf_desc *buf_desc);
+
+/* Submit a buffer for frame reception. */
+int adin1110_submit_rx_buffer(struct adin1110_desc *desc, struct eth_mac_buf_desc *buf_desc);
+
+/* Set the OA TC6 chunk payload size. */
+int adin1110_set_chunk_size(struct adin1110_desc *desc, enum eth_mac_oa_cps cps);
+
+/* Get the current OA TC6 chunk payload size. */
+int adin1110_get_chunk_size(struct adin1110_desc *desc, enum eth_mac_oa_cps *cps);
+
+/* Enable or disable TX/RX cut-through mode. */
+int adin1110_set_cut_through_mode(struct adin1110_desc *desc, bool tx_cte, bool rx_cte);
+
+/* Get the current TX/RX cut-through mode state. */
+int adin1110_get_cut_through_mode(struct adin1110_desc *desc, bool *tx_cte, bool *rx_cte);
+
+/* Configure TX, RX-low, and RX-high FIFO sizes. */
+int adin1110_set_fifo_sizes(struct adin1110_desc *desc, struct eth_mac_fifo_size fifo_sizes);
+
+/* Read the current TX, RX-low, and RX-high FIFO sizes. */
+int adin1110_get_fifo_sizes(struct adin1110_desc *desc, struct eth_mac_fifo_size *fifo_sizes);
+
+/* Clear FIFOs according to the specified clear mode. */
+int adin1110_clear_fifos(struct adin1110_desc *desc, enum eth_mac_fifo_clr_mode clear_mode);
+
+/* Enable timestamping with the specified format. */
+int adin1110_ts_enable(struct adin1110_desc *desc, enum eth_mac_ts_format format);
+
+/* Clear all stored timestamps. */
+int adin1110_ts_clear(struct adin1110_desc *desc);
+
+/* Start the timestamp timer with the given configuration. */
+int adin1110_ts_timer_start(struct adin1110_desc *desc, struct eth_mac_ts_timer_cfg *timer_config);
+
+/* Stop the timestamp timer. */
+int adin1110_ts_timer_stop(struct adin1110_desc *desc);
+
+/* Read the externally captured timestamp. */
+int adin1110_ts_get_ext_capt_timestamp(struct adin1110_desc *desc, struct eth_mac_ts_timespec *captured_timespec);
+
+/* Set the timestamp timer to an absolute value. */
+int adin1110_ts_set_timer_absolute(struct adin1110_desc *desc, uint32_t seconds, uint32_t nanoseconds);
+
+/* Synchronize the local clock using PTP-style error correction. */
+int adin1110_ts_sync_clock(struct adin1110_desc *desc, int64_t time_error, uint64_t reference_time_ns_diff, uint64_t local_time_ns_diff);
+
+/* Read an egress (TX) capture timestamp. */
+int adin1110_ts_get_egress_timestamp(struct adin1110_desc *desc, enum eth_mac_egress_capture egress_reg, struct eth_mac_ts_timespec *captured_timespec);
+
+/* Convert raw timestamp words to a timespec structure. */
+int adin1110_ts_convert(struct adin1110_desc *desc, uint32_t timestamp_low_word, uint32_t timestamp_high_word, enum eth_mac_ts_format format, struct eth_mac_ts_timespec *timespec);
+
+/* Compute the signed difference between two timestamps in nanoseconds. */
+int64_t adin1110_ts_subtract(struct adin1110_desc *desc, struct eth_mac_ts_timespec *ts_a, struct eth_mac_ts_timespec *ts_b);
+
+/* Register a callback for a MAC event. */
+int adin1110_register_callback(struct adin1110_desc *desc, struct eth_mac_callback cb_func, enum eth_mac_event cb_event);
+
+/* Write a 32-bit value to a MAC register. */
+int adin1110_write_register(struct adin1110_desc *desc, uint16_t reg_addr, uint32_t reg_data);
+
+/* Read a 32-bit value from a MAC register. */
+int adin1110_ReadRegister(struct adin1110_desc *desc, uint16_t reg_addr, uint32_t *reg_data);
+
+/* Write a 16-bit value to a PHY register via MDIO. */
+int adin1110_phy_write(struct adin1110_desc *desc, uint32_t reg_addr, uint16_t reg_data);
+
+/* Read a 16-bit value from a PHY register via MDIO. */
+int adin1110_phy_read(struct adin1110_desc *desc, uint32_t reg_addr, uint16_t *reg_data);
+
+/* Bring the ADIN1110 out of software power-down. */
+int adin1110_enable(struct adin1110_desc *desc);
+
+/* Put the ADIN1110 into software power-down. */
+int adin1110_disable(struct adin1110_desc *desc);
+
+/* Read the PHY mean-squared-error link quality metric. */
+int adin1110_get_mse_link_quality(struct adin1110_desc *desc, struct spe_phy_MseLinkQuality_t *mse_link_quality);
+
+/* Enable or disable the PHY frame generator. */
+int adin1110_frame_gen_en(struct adin1110_desc *desc, bool enable);
+
+/* Set the frame generator operating mode (burst or continuous). */
+int adin1110_frame_gen_set_mode(struct adin1110_desc *desc, enum spe_phy_FrameGenMode_e mode);
+
+/* Set the number of frames for the frame generator to produce. */
+int adin1110_frame_gen_set_frame_cnt(struct adin1110_desc *desc, uint32_t frame_count);
+
+/* Set the frame generator payload pattern. */
+int adin1110_frame_gen_set_frame_payload(struct adin1110_desc *desc, enum spe_phy_FrameGenPayload_e payload);
+
+/* Set the frame generator frame length (46–1518 bytes). */
+int adin1110_frame_gen_set_frame_len(struct adin1110_desc *desc, uint16_t frame_len);
+
+/* Set the frame generator inter-frame gap length. */
+int adin1110_frame_gen_set_ifg_len(struct adin1110_desc *desc, uint16_t ifg_len);
+
+/* Restart the frame generator. */
+int adin1110_frame_gen_restart(struct adin1110_desc *desc);
+
+/* Check whether the frame generator has finished. */
+int adin1110_frame_gen_done(struct adin1110_desc *desc, bool *fg_done);
+
+/* Enable or disable the PHY frame checker. */
+int adin1110_frame_check_enable(struct adin1110_desc *desc, bool enable);
+
+/* Select the frame checker source (MAC or PHY). */
+int adin1110_frame_check_source_select(struct adin1110_desc *desc, enum spe_phy_FrameChkSource_e source);
+
+/* Read the frame checker received frame count. */
+int adin1110_frame_check_read_frame_count(struct adin1110_desc *desc, uint32_t *count);
+
+/* Read the frame checker RX error count. */
+int adin1110_frame_check_read_rx_err_counnt(struct adin1110_desc *desc, uint16_t *count);
+
+/* Read all frame checker error counters. */
+int adin1110_frame_check_read_error_count(struct adin1110_desc *desc, struct spe_phy_FrameChkErrorCounters_t *count);
+
+/* Store a user-defined context pointer in the device descriptor. */
+int adin1110_set_user_context(struct adin1110_desc *desc, void *context);
+
+/* Retrieve the user-defined context pointer from the device descriptor. */
+void *adin1110_get_user_context(struct adin1110_desc *desc);
 
 #endif
